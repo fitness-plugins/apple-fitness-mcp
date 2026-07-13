@@ -1,0 +1,26 @@
+# --- Personal / private data (never commit real health data) ---
+data/
+logs/
+*.duckdb
+*.duckdb.wal
+export.xml
+export_cda.xml
+*.zip
+apple_health_export/
+
+# --- Local Claude Code settings (machine-specific permissions) ---
+.claude/settings.local.json
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+
+# --- OS ---
+.DS_Store
