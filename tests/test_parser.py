@@ -195,6 +195,28 @@ def test_reload_bad_zip_reports_error(sandbox):
     assert r["status"] == "error"
 
 
+def test_get_sleep_wake_day_and_filter_consistency(sandbox):
+    from apple_health_mcp import server
+
+    server._schema_ready = False  # re-init against this sandbox DB
+    archive = _write_zip(config.EXPORT_DIR, SAMPLE_XML)
+    import_pipeline.import_archive(archive)
+    server._schema_ready = False
+
+    # Sample's only sleep segment (deep, 2024-05-01 23:30 -> 2024-05-02 00:30)
+    # is attributed to the WAKE day 2024-05-02, not the bedtime day.
+    nights = server.get_sleep()["nights"]
+    assert len(nights) == 1
+    assert nights[0]["night"] == "2024-05-02"
+    assert nights[0]["stages"]["deep"] == 1.0
+    assert abs(nights[0]["hours_asleep"] - 1.0) < 1e-9
+
+    # Filter and grouping use the SAME wake-day: asking for the wake day returns
+    # the night; asking for the bedtime day returns nothing (the bug we fixed).
+    assert len(server.get_sleep("2024-05-02", "2024-05-02")["nights"]) == 1
+    assert server.get_sleep("2024-05-01", "2024-05-01")["nights"] == []
+
+
 def test_empty_database_is_queryable(sandbox):
     # No archive imported: schema must still initialize and queries return empty.
     con = storage.connect()

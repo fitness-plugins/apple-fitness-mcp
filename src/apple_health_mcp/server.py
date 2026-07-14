@@ -32,13 +32,26 @@ _SUM_METRICS = {
 _GRAN = {"day": "day", "week": "week", "month": "month"}
 
 
+_schema_ready = False
+
+
 def _ensure_ready() -> None:
-    """Guarantee the schema exists so even a brand-new/empty DB is queryable."""
+    """Guarantee the schema exists so even a brand-new/empty DB is queryable.
+
+    Runs the read-write init at most once per process: doing it on every tool
+    call would repeatedly grab the write lock and can conflict with a read-only
+    connection held elsewhere in the same process (DuckDB forbids mixing
+    read-write and read-only handles to one file within a process).
+    """
+    global _schema_ready
+    if _schema_ready:
+        return
     con = storage.connect()
     try:
         storage.init_schema(con)
     finally:
         con.close()
+    _schema_ready = True
 
 
 def _q(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
@@ -161,16 +174,30 @@ def get_vo2max(start_date: Optional[str] = None,
 
 @mcp.tool(annotations=RO,
           description="Nightly sleep broken down by stage (in_bed, core, deep, "
-                      "rem, awake) with total hours asleep.")
+                      "rem, awake) with total hours asleep. Each night is dated "
+                      "by the WAKE day, so get_sleep for a date returns the "
+                      "sleep you woke from that day. start_date/end_date filter "
+                      "on that same wake-day, inclusive.")
 def get_sleep(start_date: Optional[str] = None,
               end_date: Optional[str] = None) -> dict:
     _ensure_ready()
+    # Attribute each segment to the "sleep day" = the day you wake up. A sleep
+    # day runs 18:00 -> 18:00, so an evening's pre-midnight sleep and the next
+    # morning's sleep share the same (wake) date. Shifting +6h makes the day
+    # boundary fall at 18:00. CRITICAL: filter and group on the SAME expression,
+    # otherwise a date query returns a differently-labelled night.
+    night_expr = "(start_ts + INTERVAL 6 HOUR)::DATE"
     params: list = []
-    where = _date_filter("start_ts", start_date, end_date, params)
-    # Attribute each segment to the night it belongs to: sleep after midnight is
-    # grouped with the previous evening by shifting 12h back before truncating.
+    clauses = []
+    if start_date:
+        clauses.append(f"{night_expr} >= CAST(? AS DATE)")
+        params.append(start_date)
+    if end_date:
+        clauses.append(f"{night_expr} <= CAST(? AS DATE)")
+        params.append(end_date)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = _q(
-        "SELECT (start_ts - INTERVAL 12 HOUR)::DATE AS night, stage, "
+        f"SELECT {night_expr} AS night, stage, "
         "round(sum(date_diff('second', start_ts, end_ts)) / 3600.0, 2) AS hours "
         f"FROM sleep{where} GROUP BY night, stage ORDER BY night, stage",
         tuple(params),
