@@ -22,42 +22,42 @@ automated on the Mac.
 
 ```
 ┌──────────────────────┐
-│  iPhone — Health app  │
-│  Export All Health    │  profile → Export All Health Data (manual, ~1 min)
-│  Data  →  Save to     │  → Save to Files → iCloud Drive/AppleHealthExport
-│  Files (iCloud)       │
+│  iPhone — Health app │
+│  Export All Health   │  profile → Export All Health Data (manual, ~1 min)
+│  Data  →  Save to    │  → Save to Files → iCloud Drive/AppleHealthExport
+│  Files (iCloud)      │
 └──────────┬───────────┘
            │ saves  export.zip
            ▼
 ┌──────────────────────┐
-│  iCloud Drive         │  ~/Library/Mobile Documents/com~apple~CloudDocs/
-│  AppleHealthExport/   │  AppleHealthExport/
+│  iCloud Drive        │  ~/Library/Mobile Documents/com~apple~CloudDocs/
+│  AppleHealthExport/  │  AppleHealthExport/
 └──────────┬───────────┘
            │ file appears (synced to Mac)
            ▼
 ┌──────────────────────┐
-│  Import pipeline      │  triggered ON DEMAND (no background jobs):
-│  (on request)         │   • ask Claude → reload_data tool
-│                       │   • uv run apple-health-import
-│                       │   • ./setup.sh
+│  Import pipeline     │  triggered ON DEMAND (no background jobs):
+│  (on request)        │   • ask Claude → reload_data tool
+│                      │   • uv run apple-health-import
+│                      │   • ./setup.sh
 └──────────┬───────────┘
            │ unzip → streaming iterparse → normalize → upsert
            ▼
 ┌──────────────────────┐
-│  DuckDB               │  data/health.duckdb
-│  records / workouts / │  date-indexed, deduplicated view
-│  sleep / clinical     │
+│  DuckDB              │  data/health.duckdb
+│  records / workouts /│  date-indexed, deduplicated view
+│  sleep / clinical    │
 └──────────┬───────────┘
            │ read-only SQL, per-call connection
            ▼
 ┌──────────────────────┐
-│  MCP server (stdio)   │  FastMCP · read-only tools + reload_data
-│  apple_health_mcp     │
+│  MCP server (stdio)  │  FastMCP · read-only tools + reload_data
+│  apple_health_mcp    │
 └──────────┬───────────┘
            │ stdio
            ▼
 ┌──────────────────────┐
-│  Claude Desktop       │  ask questions in plain English
+│  Claude Desktop      │  ask questions in plain English
 └──────────────────────┘
 ```
 
