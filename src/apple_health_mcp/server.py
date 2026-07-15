@@ -12,7 +12,7 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from . import config, import_pipeline, storage
+from . import analytics, config, import_pipeline, storage
 
 mcp = FastMCP("apple-health")
 
@@ -233,6 +233,276 @@ def get_workouts(start_date: Optional[str] = None, end_date: Optional[str] = Non
         tuple(params),
     )
     return {"count": len(rows), "workouts": rows}
+
+
+# --- intraday training analytics ------------------------------------------------
+
+
+@mcp.tool(annotations=RO,
+          description="Full intraday breakdown of one workout: binned HR / power "
+                      "/ speed (pace) / cadence series, time in HR zones, aerobic "
+                      "decoupling (cardiac drift), and per-km splits. Picks the "
+                      "workout by workout_id (row_hash), or the most recent one "
+                      "matching optional type/date filters. max_hr defaults to the "
+                      "athlete's observed max across all workouts. Metrics absent "
+                      "from a given workout (e.g. power on a walk) degrade to null.")
+def get_workout_detail(workout_id: Optional[str] = None,
+                       type: Optional[str] = None, date: Optional[str] = None,
+                       bin_seconds: int = 30,
+                       max_hr: Optional[int] = None) -> dict:
+    _ensure_ready()
+    w = analytics.select_workout(_q, workout_id=workout_id, type=type, date=date)
+    if not w:
+        return {"error": "No matching workout found.",
+                "note": "Adjust workout_id/type/date, or import data first."}
+    hr_max, hr_src = analytics.resolve_max_hr(_q, max_hr)
+    start, end = w["start_ts"], w["end_ts"]
+
+    # 2. binned series with derived pace + cadence.
+    points = analytics.binned_series(_q, start, end, bin_seconds,
+                                     analytics.SERIES_METRICS)
+    for p in points:
+        p["pace_min_per_km"] = analytics.pace_min_per_km(p.get("speed"))
+        p["cadence_spm"] = analytics.cadence_spm(p.get("speed"), p.get("stride"))
+        for k in ("hr", "power", "speed", "stride"):
+            if p.get(k) is not None:
+                p[k] = round(p[k], 1)
+
+    # 3. HR zones over the window.
+    zones = analytics.zone_time(
+        _q, "type = 'heart_rate' AND start_ts >= ? AND start_ts <= ?",
+        (start, end), hr_max)
+
+    # 4. decoupling: split the window in half, HR-to-power (or HR-to-speed) drift.
+    mid = start + (end - start) / 2
+    halves = _q(
+        "SELECT CASE WHEN start_ts < ? THEN 1 ELSE 2 END AS half, "
+        "avg(value) FILTER (WHERE type = 'heart_rate') AS hr, "
+        "avg(value) FILTER (WHERE type = 'running_power') AS power, "
+        "avg(value) FILTER (WHERE type = 'running_speed') AS speed "
+        "FROM records_dedup WHERE start_ts >= ? AND start_ts <= ? "
+        "GROUP BY half ORDER BY half",
+        (mid, start, end))
+    decoupling = _decoupling_from_halves(halves)
+
+    # 5. per-km splits from cumulative running distance.
+    splits = _km_splits(start, end)
+
+    summary = {
+        "workout_id": w["row_hash"],
+        "type": w["type"],
+        "start_ts": w["start_ts"], "end_ts": w["end_ts"],
+        "duration_min": round(w["duration"], 1) if w["duration"] else None,
+        "distance_km": round(w["distance"], 3) if w["distance"] else None,
+        "energy_kcal": round(w["energy"], 1) if w["energy"] else None,
+        "avg_hr": round(w["avg_hr"], 0) if w["avg_hr"] else None,
+        "max_hr": round(w["max_hr"], 0) if w["max_hr"] else None,
+        "source_name": w["source_name"],
+        "max_hr_used": hr_max, "max_hr_source": hr_src,
+    }
+    return {
+        "summary": summary,
+        "series": {"bin_seconds": bin_seconds, "count": len(points),
+                   "points": points},
+        "hr_zones": zones,
+        "decoupling": decoupling,
+        "splits": splits,
+        "note": f"max_hr {hr_max} bpm ({hr_src}). Missing metrics are null "
+                "(e.g. no power/cadence when the device didn't record them).",
+    }
+
+
+def _decoupling_from_halves(halves: list[dict]) -> dict:
+    """Aerobic decoupling from the two half-window aggregate rows."""
+    by_half = {r["half"]: r for r in halves}
+    h1, h2 = by_half.get(1), by_half.get(2)
+    if not h1 or not h2:
+        return {"drift_pct": None,
+                "note": "Not enough data in both halves to compute drift."}
+    # Prefer HR:power (efficiency); fall back to HR:speed when power is absent.
+    if h1.get("power") and h2.get("power"):
+        basis = "hr_to_power"
+        r1 = h1["hr"] / h1["power"] if h1.get("hr") else None
+        r2 = h2["hr"] / h2["power"] if h2.get("hr") else None
+    else:
+        basis = "hr_to_speed"
+        r1 = h1["hr"] / h1["speed"] if h1.get("hr") and h1.get("speed") else None
+        r2 = h2["hr"] / h2["speed"] if h2.get("hr") and h2.get("speed") else None
+    drift = analytics.decoupling(r1, r2)
+    return {
+        "drift_pct": drift,
+        "basis": basis,
+        "first_half_ratio": round(r1, 4) if r1 else None,
+        "second_half_ratio": round(r2, 4) if r2 else None,
+        "good_aerobic_control": (drift is not None and drift < 5),
+    }
+
+
+def _km_splits(start, end) -> list[dict]:
+    """Per-kilometre splits from cumulative distance_walking_running samples.
+
+    Each sample carries a distance delta (km); the running total assigns each
+    sample to a km bucket. Split time is the gap between successive buckets'
+    first samples (last split runs to the workout end)."""
+    rows = _q(
+        "WITH d AS ("
+        "  SELECT start_ts, "
+        "    sum(value) OVER (ORDER BY start_ts) AS cum_km "
+        "  FROM records_dedup "
+        "  WHERE type = 'distance_walking_running' "
+        "    AND start_ts >= ? AND start_ts <= ?"
+        ") "
+        # round before ceil so a float artifact at an exact km boundary (e.g.
+        # cum_km = 2.0000000004) doesn't spawn a spurious trailing split.
+        "SELECT cast(ceil(round(cum_km, 6)) AS INT) AS km, "
+        "min(start_ts) AS t_start, sum(1) AS samples "
+        "FROM d WHERE cum_km > 0 GROUP BY km ORDER BY km",
+        (start, end))
+    if not rows:
+        return []
+    splits = []
+    for i, r in enumerate(rows):
+        t0 = r["t_start"]
+        t1 = rows[i + 1]["t_start"] if i + 1 < len(rows) else end
+        dur = (t1 - t0).total_seconds()
+        splits.append({
+            "km": r["km"],
+            "duration_sec": round(dur, 1),
+            "pace_min_per_km": round(dur / 60.0, 2) if dur else None,
+        })
+    return splits
+
+
+@mcp.tool(annotations=RO,
+          description="Time spent in heart-rate zones Z1-Z5 aggregated over a "
+                      "period (not a single workout). scope='workouts' counts "
+                      "only HR recorded inside logged workout windows; "
+                      "scope='all' counts every heart_rate sample in range. "
+                      "max_hr defaults to the observed workout max. Zones: "
+                      "Z1<60% Z2 60-70 Z3 70-80 Z4 80-90 Z5>=90% of max.")
+def get_hr_zones(start_date: Optional[str] = None, end_date: Optional[str] = None,
+                 max_hr: Optional[int] = None, scope: str = "workouts") -> dict:
+    _ensure_ready()
+    hr_max, hr_src = analytics.resolve_max_hr(_q, max_hr)
+    clauses = ["type = 'heart_rate'"]
+    params: list = []
+    rng = _date_filter("start_ts", start_date, end_date, params)
+    if rng:
+        clauses.append(rng.replace(" WHERE ", ""))
+    if scope == "workouts":
+        clauses.append(
+            "EXISTS (SELECT 1 FROM workouts w "
+            "WHERE records_dedup.start_ts BETWEEN w.start_ts AND w.end_ts)")
+    where_sql = " AND ".join(clauses)
+    zones = analytics.zone_time(_q, where_sql, tuple(params), hr_max)
+    return {
+        "scope": scope,
+        "max_hr_used": hr_max, "max_hr_source": hr_src,
+        **zones,
+        "note": f"max_hr {hr_max} bpm ({hr_src}). Time weighted by gaps between "
+                "samples, capped at 60s. scope='all' includes non-workout HR.",
+    }
+
+
+@mcp.tool(annotations=RO,
+          description="Daily training load and acute:chronic workload ratio "
+                      "(ACWR) over a period. Load is Banister TRIMP from a "
+                      "workout's HR reserve where avg_hr exists, otherwise an "
+                      "active-energy proxy so unlogged effort still counts. ACWR "
+                      "= 7-day acute load vs 28-day chronic; 0.8-1.3 is the "
+                      "sweet spot, >1.5 flags elevated injury risk. max_hr / "
+                      "resting_hr default to observed values.")
+def get_training_load(start_date: Optional[str] = None,
+                      end_date: Optional[str] = None, max_hr: Optional[int] = None,
+                      resting_hr: Optional[int] = None) -> dict:
+    _ensure_ready()
+    hr_max, hr_src = analytics.resolve_max_hr(_q, max_hr)
+    rest, rest_src = analytics.resolve_resting_hr(_q, resting_hr,
+                                                  start_date, end_date)
+    daily = _training_daily(start_date, end_date, hr_max, rest)
+    # Build a contiguous daily series for ACWR over the covered span.
+    acwr_series: list[dict] = []
+    if daily:
+        first = min(d["date"] for d in daily)
+        last = max(d["date"] for d in daily)
+        span = analytics.daily_date_range(
+            _to_dt(first), _to_dt(last))
+        load_by_day = {d["date"]: d["load"] for d in daily}
+        dates = [str(d) for d in span]
+        loads = [load_by_day.get(str(d), 0.0) for d in span]
+        acwr_series = analytics.acwr(dates, loads)
+    latest = acwr_series[-1] if acwr_series else None
+    return {
+        "max_hr_used": hr_max, "max_hr_source": hr_src,
+        "resting_hr_used": rest, "resting_hr_source": rest_src,
+        "daily": daily,
+        "acwr": acwr_series,
+        "latest_acwr": latest,
+        "note": f"TRIMP (Banister, male coeffs) uses max_hr {hr_max}, resting "
+                f"{rest}. Days without HR use an active-energy proxy "
+                f"(kcal above {int(analytics.NONEXERCISE_BASELINE_KCAL)} baseline "
+                f"x {analytics.ENERGY_LOAD_K}).",
+    }
+
+
+def _to_dt(date_str: str):
+    from datetime import datetime as _d
+    return _d.fromisoformat(str(date_str))
+
+
+def _training_daily(start_date, end_date, hr_max, rest) -> list[dict]:
+    """Per-day training load: TRIMP from workouts (energy proxy when HR absent),
+    plus an active-energy proxy on days with no logged workout."""
+    params: list = []
+    where = _date_filter("start_ts", start_date, end_date, params)
+    wk = _q(
+        "SELECT start_ts::DATE AS day, duration, avg_hr, energy "
+        f"FROM workouts{where} ORDER BY day",
+        tuple(params))
+    by_day: dict[str, dict] = {}
+    workout_days: set[str] = set()
+    for w in wk:
+        day = str(w["day"])
+        workout_days.add(day)
+        load = analytics.trimp(w["duration"] or 0, w["avg_hr"], rest, hr_max)
+        method = "trimp"
+        if load is None:
+            load = round((w["energy"] or 0) * analytics.ENERGY_LOAD_K, 1)
+            method = "energy_proxy"
+        d = by_day.setdefault(day, {"date": day, "load": 0.0, "workouts": 0,
+                                    "methods": set()})
+        d["load"] += load
+        d["workouts"] += 1
+        d["methods"].add(method)
+
+    # Days with no workout but meaningful active energy -> unlogged-effort proxy.
+    eparams: list = []
+    ewhere = _date_filter("start_ts", start_date, end_date, eparams)
+    eclause = " AND type = 'active_energy'" if ewhere else \
+        " WHERE type = 'active_energy'"
+    energy_rows = _q(
+        "SELECT start_ts::DATE AS day, sum(value) AS kcal "
+        f"FROM records_dedup{ewhere}{eclause} GROUP BY day ORDER BY day",
+        tuple(eparams))
+    for e in energy_rows:
+        day = str(e["day"])
+        if day in workout_days:
+            continue
+        extra = (e["kcal"] or 0) - analytics.NONEXERCISE_BASELINE_KCAL
+        if extra <= 0:
+            continue
+        load = round(extra * analytics.ENERGY_LOAD_K, 1)
+        by_day[day] = {"date": day, "load": load, "workouts": 0,
+                       "methods": {"energy_proxy"}}
+
+    out = []
+    for day in sorted(by_day):
+        d = by_day[day]
+        methods = d["methods"]
+        method = next(iter(methods)) if len(methods) == 1 else "mixed"
+        out.append({"date": d["date"], "load": round(d["load"], 1),
+                    "workouts": d["workouts"], "method": method})
+    return out
 
 
 # --- read-only SQL escape hatch -------------------------------------------------
