@@ -7,6 +7,7 @@ client over stdio.
 from __future__ import annotations
 
 import re
+from datetime import timedelta
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -244,8 +245,10 @@ def get_workouts(start_date: Optional[str] = None, end_date: Optional[str] = Non
                       "decoupling (cardiac drift), and per-km splits. Picks the "
                       "workout by workout_id (row_hash), or the most recent one "
                       "matching optional type/date filters. max_hr defaults to the "
-                      "athlete's observed max across all workouts. Metrics absent "
-                      "from a given workout (e.g. power on a walk) degrade to null.")
+                      "athlete's observed max across all workouts. HR zones: "
+                      "Z1 <60%, Z2 60-70%, Z3 70-80%, Z4 80-90%, Z5 >=90% of "
+                      "max_hr. Metrics absent from a given workout (e.g. power on "
+                      "a walk) degrade to null.")
 def get_workout_detail(workout_id: Optional[str] = None,
                        type: Optional[str] = None, date: Optional[str] = None,
                        bin_seconds: int = 30,
@@ -346,7 +349,7 @@ def _km_splits(start, end) -> list[dict]:
     first samples (last split runs to the workout end)."""
     rows = _q(
         "WITH d AS ("
-        "  SELECT start_ts, "
+        "  SELECT start_ts, value, "
         "    sum(value) OVER (ORDER BY start_ts) AS cum_km "
         "  FROM records_dedup "
         "  WHERE type = 'distance_walking_running' "
@@ -354,22 +357,32 @@ def _km_splits(start, end) -> list[dict]:
         ") "
         # round before ceil so a float artifact at an exact km boundary (e.g.
         # cum_km = 2.0000000004) doesn't spawn a spurious trailing split.
+        # dist_km = distance actually covered in the bucket (sum of sample deltas).
         "SELECT cast(ceil(round(cum_km, 6)) AS INT) AS km, "
-        "min(start_ts) AS t_start, sum(1) AS samples "
+        "min(start_ts) AS t_start, sum(value) AS dist_km, sum(1) AS samples "
         "FROM d WHERE cum_km > 0 GROUP BY km ORDER BY km",
         (start, end))
     if not rows:
         return []
     splits = []
+    last = len(rows) - 1
     for i, r in enumerate(rows):
         t0 = r["t_start"]
         t1 = rows[i + 1]["t_start"] if i + 1 < len(rows) else end
         dur = (t1 - t0).total_seconds()
-        splits.append({
-            "km": r["km"],
-            "duration_sec": round(dur, 1),
-            "pace_min_per_km": round(dur / 60.0, 2) if dur else None,
-        })
+        dur_min = dur / 60.0
+        dist = r["dist_km"] or 0.0
+        split = {"km": r["km"], "duration_sec": round(dur, 1)}
+        # A trailing partial km would misreport pace if elapsed minutes were shown
+        # as if a full km; scale by the real distance and flag it.
+        if i == last and dist < 0.95:
+            split["distance_km"] = round(dist, 3)
+            split["partial"] = True
+            split["pace_min_per_km"] = (round(dur_min / dist, 2)
+                                        if dist > 0 and dur else None)
+        else:
+            split["pace_min_per_km"] = round(dur_min, 2) if dur else None
+        splits.append(split)
     return splits
 
 
@@ -378,8 +391,10 @@ def _km_splits(start, end) -> list[dict]:
                       "period (not a single workout). scope='workouts' counts "
                       "only HR recorded inside logged workout windows; "
                       "scope='all' counts every heart_rate sample in range. "
-                      "max_hr defaults to the observed workout max. Zones: "
-                      "Z1<60% Z2 60-70 Z3 70-80 Z4 80-90 Z5>=90% of max.")
+                      "max_hr defaults to the observed workout max. HR zones: "
+                      "Z1 <60%, Z2 60-70%, Z3 70-80%, Z4 80-90%, Z5 >=90% of "
+                      "max_hr (Z1 has no lower gap, so scope='all' totals include "
+                      "rest/sleep HR).")
 def get_hr_zones(start_date: Optional[str] = None, end_date: Optional[str] = None,
                  max_hr: Optional[int] = None, scope: str = "workouts") -> dict:
     _ensure_ready()
@@ -417,20 +432,38 @@ def get_training_load(start_date: Optional[str] = None,
                       resting_hr: Optional[int] = None) -> dict:
     _ensure_ready()
     hr_max, hr_src = analytics.resolve_max_hr(_q, max_hr)
-    rest, rest_src = analytics.resolve_resting_hr(_q, resting_hr,
-                                                  start_date, end_date)
-    daily = _training_daily(start_date, end_date, hr_max, rest)
-    # Build a contiguous daily series for ACWR over the covered span.
-    acwr_series: list[dict] = []
-    if daily:
-        first = min(d["date"] for d in daily)
-        last = max(d["date"] for d in daily)
-        span = analytics.daily_date_range(
-            _to_dt(first), _to_dt(last))
-        load_by_day = {d["date"]: d["load"] for d in daily}
+    rest, rest_src = analytics.resolve_resting_hr(_q, resting_hr)
+
+    # Seed the ACWR rolling windows with the 28 days BEFORE start_date so the
+    # 7-/28-day averages for the first displayed day reflect real prior load
+    # rather than starting from zero. Load is still computed the same way, just
+    # over an extended [calc_start, end_date] range.
+    calc_start = start_date
+    if start_date:
+        calc_start = (_to_dt(start_date).date()
+                      - timedelta(days=28)).isoformat()
+    daily_ext = _training_daily(calc_start, end_date, hr_max, rest)
+
+    acwr_all: list[dict] = []
+    if daily_ext:
+        first = min(d["date"] for d in daily_ext)
+        last = max(d["date"] for d in daily_ext)
+        span = analytics.daily_date_range(_to_dt(first), _to_dt(last))
+        load_by_day = {d["date"]: d["load"] for d in daily_ext}
         dates = [str(d) for d in span]
         loads = [load_by_day.get(str(d), 0.0) for d in span]
-        acwr_series = analytics.acwr(dates, loads)
+        # Flag insufficient_history against the dataset's true first day, not the
+        # (possibly recent) query start.
+        acwr_all = analytics.acwr(dates, loads,
+                                  min_history_date=_dataset_start())
+
+    # Emit only the display range; acute/chronic already reflect the lookback.
+    def _in_range(day: str) -> bool:
+        return ((start_date is None or day >= start_date)
+                and (end_date is None or day <= end_date))
+
+    daily = [d for d in daily_ext if _in_range(d["date"])]
+    acwr_series = [a for a in acwr_all if _in_range(a["date"])]
     latest = acwr_series[-1] if acwr_series else None
     return {
         "max_hr_used": hr_max, "max_hr_source": hr_src,
@@ -448,6 +481,20 @@ def get_training_load(start_date: Optional[str] = None,
 def _to_dt(date_str: str):
     from datetime import datetime as _d
     return _d.fromisoformat(str(date_str))
+
+
+def _dataset_start():
+    """Earliest day the dataset carries any load-bearing data (active_energy or a
+    workout). Used so ACWR only flags insufficient_history genuinely early in the
+    whole dataset, not merely early in a query window."""
+    rows = _q(
+        "SELECT min(day) AS d FROM ("
+        "  SELECT min(start_ts)::DATE AS day FROM records_dedup "
+        "    WHERE type = 'active_energy' "
+        "  UNION ALL SELECT min(start_ts)::DATE FROM workouts"
+        ") t")
+    d = rows[0]["d"] if rows else None
+    return d  # a datetime.date, or None on an empty database
 
 
 def _training_daily(start_date, end_date, hr_max, rest) -> list[dict]:

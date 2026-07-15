@@ -49,10 +49,19 @@ def _build_xml() -> str:
         rec("HKQuantityTypeIdentifierDistanceWalkingRunning", "km", 0.1, ts)
         rec("HKQuantityTypeIdentifierActiveEnergyBurned", "kcal", 6, ts)
 
-    # Resting HR across a few days (avg 50).
-    for d in range(1, 6):
-        ts = f"2024-05-0{d} 07:00:00 -0700"
-        rec("HKQuantityTypeIdentifierRestingHeartRate", "count/min", 50, ts)
+    # Resting HR skewed high (mean ~73) with a couple of genuinely low readings,
+    # so a low percentile (~56) is clearly distinct from the mean.
+    resting_vals = [55, 56, 74, 75, 76, 77, 78, 79, 80, 81]
+    for i, v in enumerate(resting_vals):
+        ts = _ts(datetime(2024, 4, 21, 7, 0, 0), i * 86400)
+        rec("HKQuantityTypeIdentifierRestingHeartRate", "count/min", v, ts)
+
+    # Two low resting-time HR samples (well below 60% of max) so scope='all'
+    # zone totals include sub-threshold HR in Z1.
+    rec("HKQuantityTypeIdentifierHeartRate", "count/min", 50,
+        "2024-05-04 03:00:00 -0700")
+    rec("HKQuantityTypeIdentifierHeartRate", "count/min", 50,
+        "2024-05-04 03:00:30 -0700")
 
     # A non-workout day (2024-05-05) with lots of active energy -> energy proxy.
     for h in range(10):
@@ -80,8 +89,60 @@ def _build_xml() -> str:
     )
 
 
-@pytest.fixture()
-def sandbox(tmp_path, monkeypatch):
+def _build_long_xml() -> str:
+    """~7 weeks of one active_energy record per day (700 kcal) so every day gets a
+    steady energy-proxy load and ACWR has real 28-day history to seed from.
+    00:00 -0700 -> 12:00 local (+05), keeping each record on its label date."""
+    rows = []
+    start = datetime(2024, 3, 1, 0, 0, 0)
+    for i in range(51):                       # 2024-03-01 .. 2024-04-20
+        ts = _ts(start, i * 86400)
+        rows.append(
+            '<Record type="HKQuantityTypeIdentifierActiveEnergyBurned" '
+            f'sourceName="Maksim\'s Apple Watch" unit="kcal" value="700" '
+            f'startDate="{ts}" endDate="{ts}" creationDate="{ts}"/>'
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n<HealthData locale="en_US">\n'
+        '<ExportDate value="2024-06-01 09:00:00 -0700"/>\n'
+        + "\n".join(rows) + "\n</HealthData>\n"
+    )
+
+
+def _build_partial_xml() -> str:
+    """A 2.5 km run at constant 12 km/h, so the final km is a 0.5 km partial."""
+    rows = []
+
+    def rec(rtype, unit, value, ts):
+        rows.append(
+            f'<Record type="{rtype}" sourceName="Maksim\'s Apple Watch" '
+            f'unit="{unit}" value="{value}" startDate="{ts}" endDate="{ts}" '
+            f'creationDate="{ts}"/>'
+        )
+
+    start = datetime(2024, 6, 1, 6, 0, 0)
+    n = 25                                    # 25 * 0.1 km = 2.5 km
+    for i in range(n):
+        ts = _ts(start, i * 30)
+        rec("HKQuantityTypeIdentifierHeartRate", "count/min", 150, ts)
+        rec("HKQuantityTypeIdentifierRunningSpeed", "km/hr", 12, ts)
+        rec("HKQuantityTypeIdentifierDistanceWalkingRunning", "km", 0.1, ts)
+    workout = (
+        '<Workout workoutActivityType="HKWorkoutActivityTypeRunning" '
+        'sourceName="Maksim\'s Apple Watch" duration="12.5" durationUnit="min" '
+        f'startDate="{_ts(start, 0)}" endDate="{_ts(start, n * 30)}">'
+        '<WorkoutStatistics type="HKQuantityTypeIdentifierDistanceWalkingRunning" '
+        'sum="2.5" unit="km"/>'
+        '</Workout>'
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n<HealthData locale="en_US">\n'
+        '<ExportDate value="2024-06-01 09:00:00 -0700"/>\n'
+        + "\n".join(rows) + "\n" + workout + "\n</HealthData>\n"
+    )
+
+
+def _install(tmp_path, monkeypatch, xml: str):
     db = tmp_path / "health.duckdb"
     exp = tmp_path / "AppleHealthExport"
     exp.mkdir()
@@ -92,11 +153,26 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "LOG_DIR", tmp_path / "logs")
     archive = exp / "export.zip"
     with zipfile.ZipFile(archive, "w") as zf:
-        zf.writestr("apple_health_export/export.xml", _build_xml())
+        zf.writestr("apple_health_export/export.xml", xml)
     import_pipeline.import_archive(archive)
     from apple_health_mcp import server
     server._schema_ready = False   # re-init schema against this sandbox DB
     return tmp_path
+
+
+@pytest.fixture()
+def sandbox(tmp_path, monkeypatch):
+    return _install(tmp_path, monkeypatch, _build_xml())
+
+
+@pytest.fixture()
+def long_sandbox(tmp_path, monkeypatch):
+    return _install(tmp_path, monkeypatch, _build_long_xml())
+
+
+@pytest.fixture()
+def partial_sandbox(tmp_path, monkeypatch):
+    return _install(tmp_path, monkeypatch, _build_partial_xml())
 
 
 # --- pure math ----------------------------------------------------------------
@@ -104,7 +180,8 @@ def sandbox(tmp_path, monkeypatch):
 def test_zone_bounds():
     b = analytics.zone_bounds(200)
     assert [z["zone"] for z in b] == ["Z1", "Z2", "Z3", "Z4", "Z5"]
-    assert b[0]["lo_bpm"] == 100 and b[0]["hi_bpm"] == 120
+    # Z1 spans everything below 60% (no sub-50% gap): floor is 0, top is 60%.
+    assert b[0]["lo_bpm"] == 0 and b[0]["hi_bpm"] == 120
     assert b[4]["lo_bpm"] == 180 and b[4]["hi_bpm"] == 200
 
 
@@ -150,6 +227,21 @@ def test_acwr_sweet_spot():
     assert series[0]["flag"] == "insufficient_history"
 
 
+def test_acwr_min_history_date():
+    from datetime import date
+    dates = [str(date(2024, 1, 1) + timedelta(days=i)) for i in range(35)]
+    loads = [10.0] * 35
+    # Dataset began long before this window -> even day 0 has enough history,
+    # so no day is flagged insufficient_history (the Fix-1 seeding behaviour).
+    early = analytics.acwr(dates, loads, min_history_date=date(2020, 1, 1))
+    assert all(a["flag"] != "insufficient_history" for a in early)
+    assert early[-1]["acwr"] == 1.0
+    # Dataset genuinely starts on day 0 -> first 27 days are insufficient.
+    seeded = analytics.acwr(dates, loads, min_history_date=date(2024, 1, 1))
+    assert seeded[0]["flag"] == "insufficient_history"
+    assert seeded[27]["flag"] != "insufficient_history"
+
+
 # --- tools --------------------------------------------------------------------
 
 def test_get_workout_detail(sandbox):
@@ -193,19 +285,34 @@ def test_get_hr_zones_scopes(sandbox):
     assert w["max_hr_used"] == 180
     assert w["total_minutes"] > 0
     # All in-workout HR is well above 60% of 180 (108 bpm) -> nothing in Z1.
-    z1 = next(z for z in w["zones"] if z["zone"] == "Z1")
-    assert z1["seconds"] == 0.0
+    z1w = next(z for z in w["zones"] if z["zone"] == "Z1")
+    assert z1w["seconds"] == 0.0
     assert abs(sum(z["share"] for z in w["zones"]) - 1.0) < 0.05
 
-    # scope='all' == scope='workouts' here (all HR is inside the one workout).
+    # scope='all' also picks up the two low resting-time HR samples (~50 bpm),
+    # which land in Z1 (no sub-threshold drop) and add time beyond the workout.
     a = server.get_hr_zones("2024-05-01", "2024-05-31", scope="all")
-    assert a["total_minutes"] == pytest.approx(w["total_minutes"], abs=0.2)
+    z1a = next(z for z in a["zones"] if z["zone"] == "Z1")
+    assert z1a["seconds"] > 0
+    assert a["total_minutes"] >= w["total_minutes"]
+
+
+def test_zone_definitions_aligned(sandbox):
+    from apple_health_mcp import server
+    wd = server.get_workout_detail()["hr_zones"]["zones"]
+    hz = server.get_hr_zones("2024-05-01", "2024-05-31", scope="all")["zones"]
+    # Both tools resolve the same max_hr and must report identical zone bounds.
+    key = lambda zs: [(z["zone"], z["lo_bpm"], z["hi_bpm"]) for z in zs]
+    assert key(wd) == key(hz)
+    assert wd[0]["zone"] == "Z1" and wd[0]["lo_bpm"] == 0   # Z1 = below 60%
 
 
 def test_get_training_load(sandbox):
     from apple_health_mcp import server
     t = server.get_training_load("2024-05-01", "2024-05-31")
-    assert t["resting_hr_used"] == 50               # from resting_heart_rate
+    # resting_hr is a low percentile (~56 here), well below the ~73 mean.
+    assert 50 <= t["resting_hr_used"] <= 62
+    assert "p10" in t["resting_hr_source"]
     assert t["max_hr_used"] == 180
 
     days = {d["date"]: d for d in t["daily"]}
@@ -221,3 +328,35 @@ def test_get_training_load(sandbox):
     # ACWR series is contiguous and flags each day.
     assert t["acwr"] and all("flag" in a for a in t["acwr"])
     assert t["latest_acwr"] is not None
+    # daily/acwr are emitted only for the display range (not the seeding lookback).
+    assert all("2024-05-01" <= d["date"] <= "2024-05-31" for d in t["daily"])
+
+
+def test_acwr_seeded_from_history(long_sandbox):
+    from apple_health_mcp import server
+    # Query a short sub-range that starts >28 days into the fixture's history.
+    t = server.get_training_load("2024-04-15", "2024-04-20")
+    assert t["acwr"]
+    first = t["acwr"][0]
+    # Chronic is seeded from the 28 days BEFORE the display start, so the first
+    # day is not flagged insufficient and its baseline reflects real prior load
+    # (steady 57/day -> weekly ~399), not a near-zero day-one value.
+    assert first["flag"] != "insufficient_history"
+    assert first["chronic_28d_weekly"] > 300
+    assert first["acwr"] == pytest.approx(1.0, abs=0.1)
+
+
+def test_partial_split_pace(partial_sandbox):
+    from apple_health_mcp import server
+    d = server.get_workout_detail()
+    splits = d["splits"]
+    assert len(splits) == 3                     # 2 full km + a 0.5 km partial
+    first, last = splits[0], splits[-1]
+    # Full km unchanged: ~5.0 min/km at 12 km/h, no partial marker.
+    assert "partial" not in first
+    assert first["pace_min_per_km"] == pytest.approx(5.0, abs=0.3)
+    # Trailing partial: flagged, real distance, pace scaled by distance (not the
+    # raw elapsed-minutes-as-a-full-km that would read misleadingly fast).
+    assert last["partial"] is True
+    assert last["distance_km"] == pytest.approx(0.5, abs=0.05)
+    assert last["pace_min_per_km"] > last["duration_sec"] / 60.0

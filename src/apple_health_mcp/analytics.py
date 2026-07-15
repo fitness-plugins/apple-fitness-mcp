@@ -113,7 +113,7 @@ def binned_series(q: Query, start_ts: datetime, end_ts: datetime,
 # --- (c) HR zones -------------------------------------------------------------
 
 _ZONE_PCTS = (
-    ("Z1", 0.50, 0.60),
+    ("Z1", 0.00, 0.60),
     ("Z2", 0.60, 0.70),
     ("Z3", 0.70, 0.80),
     ("Z4", 0.80, 0.90),
@@ -122,8 +122,8 @@ _ZONE_PCTS = (
 
 
 def zone_bounds(max_hr: float) -> list[dict]:
-    """Z1–Z5 nominal %-of-max bounds in bpm. Z1 also captures anything below 50%
-    and Z5 anything at/above 90%, so every sample maps to a zone."""
+    """Z1–Z5 %-of-max bounds in bpm. Z1 spans everything below 60% (lo_bpm 0)
+    and Z5 anything at/above 90%, so every sample maps to a zone with no gap."""
     out = []
     for label, lo, hi in _ZONE_PCTS:
         out.append({
@@ -204,31 +204,30 @@ def resolve_max_hr(q: Query, max_hr: Optional[int]) -> tuple[int, str]:
 
 
 def resolve_resting_hr(q: Query, resting_hr: Optional[int],
-                       start_date: Optional[str] = None,
-                       end_date: Optional[str] = None) -> tuple[int, str]:
-    """(value, source). Passed value wins; else avg(resting_heart_rate) in range
-    (falling back to all-time if the range has none); else 60."""
+                       window_days: int = 90, pct: float = 0.10) -> tuple[int, str]:
+    """(value, source). Passed value wins; else a low percentile (default p10) of
+    recent resting_heart_rate — a mean/median sits well above true resting because
+    "resting" readings still include elevated ones. Uses a trailing window anchored
+    to the most-recent reading (independent of the query range), falling back to an
+    all-time percentile, then 60.
+    """
     if resting_hr is not None:
         return int(resting_hr), "provided"
-    clauses = ["type = 'resting_heart_rate'"]
-    params: list = []
-    if start_date:
-        clauses.append("start_ts >= CAST(? AS TIMESTAMPTZ)")
-        params.append(start_date)
-    if end_date:
-        clauses.append("start_ts < CAST(? AS TIMESTAMPTZ) + INTERVAL 1 DAY")
-        params.append(end_date)
-    where = " AND ".join(clauses)
-    rows = q(f"SELECT avg(value) AS m FROM records_dedup WHERE {where}",
-             tuple(params))
+    tag = f"p{int(pct * 100)}"
+    # window_days / pct are code constants -> safe to inline.
+    rows = q(
+        f"SELECT quantile_cont(value, {pct}) AS m FROM records_dedup "
+        "WHERE type = 'resting_heart_rate' AND start_ts >= "
+        "(SELECT max(start_ts) FROM records_dedup WHERE type = 'resting_heart_rate') "
+        f"- INTERVAL {int(window_days)} DAY", ())
     m = rows[0]["m"] if rows else None
     if m:
-        return int(round(m)), "estimated from resting_heart_rate (range)"
-    rows = q("SELECT avg(value) AS m FROM records_dedup "
+        return int(round(m)), f"{tag} of resting_heart_rate (trailing {window_days}d)"
+    rows = q(f"SELECT quantile_cont(value, {pct}) AS m FROM records_dedup "
              "WHERE type = 'resting_heart_rate'", ())
     m = rows[0]["m"] if rows else None
     if m:
-        return int(round(m)), "estimated from resting_heart_rate (all-time)"
+        return int(round(m)), f"{tag} of resting_heart_rate (all-time)"
     return 60, "default (no resting_heart_rate available)"
 
 
@@ -273,13 +272,18 @@ def decoupling(ratio_first: Optional[float],
 
 
 def acwr(dates: list, loads: list[float], acute_days: int = 7,
-         chronic_days: int = 28) -> list[dict]:
+         chronic_days: int = 28, min_history_date=None) -> list[dict]:
     """Acute:chronic workload ratio over a contiguous daily load series.
 
     acute = sum of the last `acute_days` (incl. today); chronic = sum of the last
     `chronic_days` expressed as a weekly-equivalent (/ (chronic_days/acute_days)).
     Flags: 'sweet_spot' 0.8–1.3, 'elevated' > 1.5, else 'low'/'moderate'.
     `dates`/`loads` must be day-contiguous and equal length.
+
+    `min_history_date` (a `date`) is the earliest day the whole dataset has any
+    data. When given, `insufficient_history` reflects real history — a date is
+    "enough" once >= `chronic_days` precede it in the dataset — rather than the
+    series index, so a series seeded with pre-range lookback isn't mis-flagged.
     """
     out = []
     scale = chronic_days / acute_days
@@ -288,7 +292,11 @@ def acwr(dates: list, loads: list[float], acute_days: int = 7,
         chronic_window = loads[max(0, i - chronic_days + 1): i + 1]
         chronic = sum(chronic_window) / scale
         ratio = round(acute / chronic, 2) if chronic > 0 else None
-        enough = i >= chronic_days - 1
+        if min_history_date is not None:
+            day = datetime.fromisoformat(str(dates[i])).date()
+            enough = (day - min_history_date).days >= chronic_days - 1
+        else:
+            enough = i >= chronic_days - 1
         if ratio is None:
             flag = "no_load"
         elif not enough:
