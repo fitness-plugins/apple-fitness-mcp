@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A **fully local** MCP (stdio) server that exposes Apple Health export data to
 Claude Desktop via DuckDB. No cloud, no network calls, no telemetry. Apple has no
 Health API — data only comes from a manual **Export All Health Data** on the
-iPhone, saved into an iCloud folder; the Mac imports the `export.xml` inside.
+iPhone, dropped into `~/Documents/AppleHealthExport`; the Mac imports the
+`export.xml` inside.
 
 ## Environment & commands
 
@@ -31,7 +32,7 @@ running under `uv`.
 
 ## Architecture (the big picture)
 
-Flow: **iPhone Health export → iCloud folder → on-demand import → DuckDB → MCP
+Flow: **iPhone Health export → ~/Documents/AppleHealthExport → on-demand import → DuckDB → MCP
 server → Claude Desktop**. Nothing runs in the background; data is imported only
 when asked (the `reload_data` tool, `apple-health-import`, or `./setup.sh`).
 

@@ -6,10 +6,10 @@ the specific answers you ask Claude for in chat.
 
 Apple has **no cloud API** for Health — HealthKit data lives only on your
 iPhone. The one unavoidable manual step is exporting your data from the **Health
-app** (Health → profile → *Export All Health Data*) and saving the resulting
-`export.zip` into an iCloud Drive folder. Everything after that — detecting the
-export, parsing 200–800 MB XML, loading DuckDB, serving it to Claude — is
-automated on the Mac.
+app** (Health → profile → *Export All Health Data*) and getting the resulting
+`export.zip` into `~/Documents/AppleHealthExport` on your Mac. Everything after
+that — parsing 200–800 MB XML, loading DuckDB, serving it to Claude — is handled
+locally.
 
 > **Note:** This export is a **manual, repeatable** step, not a one-time
 > setup-and-forget. iOS does not provide a reliable way to schedule a full
@@ -22,21 +22,21 @@ automated on the Mac.
 
 ```
 ┌──────────────────────┐
-│  iPhone — Health app │
-│  Export All Health   │  profile → Export All Health Data (manual, ~1 min)
-│  Data  →  Save to    │  → Save to Files → iCloud Drive/AppleHealthExport
-│  Files (iCloud)      │
+│  iPhone — Health app │  Export All Health Data (manual, ~1 min),
+│  Export All Health   │  then get the export.zip onto the Mac —
+│  Data → the Mac      │  AirDrop, or iCloud if ~/Documents syncs
+│                      │
 └──────────┬───────────┘
-           │ saves  export.zip
+           │ export.zip
            ▼
 ┌──────────────────────┐
-│  iCloud Drive        │  ~/Library/Mobile Documents/com~apple~CloudDocs/
-│  AppleHealthExport/  │  AppleHealthExport/
+│  ~/Documents/        │  the drop-folder the Mac imports from
+│  AppleHealthExport/  │
 └──────────┬───────────┘
-           │ file appears (synced to Mac)
+           │ you import it — reload_data / apple-health-import
            ▼
 ┌──────────────────────┐
-│  Import pipeline     │  triggered ON DEMAND (no background jobs):
+│  Import pipeline     │  runs on demand (no background jobs):
 │  (on request)        │   • ask Claude → reload_data tool
 │                      │   • uv run apple-health-import
 │                      │   • ./setup.sh
@@ -72,7 +72,7 @@ This does everything on the Mac side, with no placeholders to edit:
 1. Creates the uv virtual environment and installs dependencies.
 2. Initializes the DuckDB schema (`data/health.duckdb`) and imports any export
    already sitting in the folder.
-3. Creates the iCloud export drop-folder if missing.
+3. Creates the export drop-folder (`~/Documents/AppleHealthExport`) if missing.
 4. Backs up your existing `claude_desktop_config.json`, then merges in the MCP
    server entry with correct absolute paths.
 5. Restarts Claude Desktop so the server is picked up.
@@ -97,27 +97,31 @@ Repeat it whenever you want Claude to see fresher data.
    (this can take a minute or more on a large history — that's normal).
 5. When the **share sheet** appears, tap **Save to Files**.
 
-### Where to place it — the drop-folder
+### Where it needs to end up — the drop-folder
 
-In the *Save to Files* screen, save into this exact location:
-
-**iCloud Drive → `AppleHealthExport`**
-
-- If the `AppleHealthExport` folder isn't there yet, create it (tap the
-  new-folder icon in the *Save to Files* screen). The Mac setup also creates it,
-  so it should already exist once iCloud syncs.
-- Tap **Save**.
-
-That iPhone location is the **same folder** the Mac reads from. On the Mac it is:
+The Mac imports from this local folder (setup creates it):
 
 ```
-~/Library/Mobile Documents/com~apple~CloudDocs/AppleHealthExport/
+~/Documents/AppleHealthExport/
 ```
+
+Because it's a local folder, get the `export.zip` there in whichever way suits
+you:
+
+- **AirDrop** (simplest): in the iPhone share sheet after export, tap **AirDrop**
+  → your Mac. Then move the received `export.zip` into
+  `~/Documents/AppleHealthExport/`.
+- **Save to Files → On My iPhone / iCloud**, then move it into that folder on the
+  Mac.
+- **If your `~/Documents` is synced to iCloud** (System Settings → Apple ID →
+  iCloud → *Desktop & Documents Folders*), you can *Save to Files* directly to
+  **iCloud Drive → Documents → AppleHealthExport** and it will sync down into the
+  same folder — no manual move.
 
 ### Then import it (on the Mac) — nothing runs in the background
 
-Once iCloud has synced the `export.zip` down (usually seconds to a couple of
-minutes), import it whenever you want, whichever is easiest:
+Once the `export.zip` is in `~/Documents/AppleHealthExport/`, import it whenever
+you want, whichever is easiest:
 
 - **Ask Claude:** *"reload my health data"* — Claude calls the `reload_data`
   tool, which imports the newest export from the folder and reports what changed.
@@ -132,9 +136,8 @@ minutes), import it whenever you want, whichever is easiest:
 - **Keeping the folder tidy is optional.** You can delete old `.zip` files after
   they've imported; the database already holds their data. Re-importing the same
   archive is harmless (it's idempotent — no duplicates).
-- **AirDrop alternative.** Instead of *Save to Files*, you can AirDrop the
-  `export.zip` to your Mac, then move it into the `AppleHealthExport` folder
-  above — import it the same way.
+- **Custom location.** Set the `HEALTH_EXPORT_DIR` environment variable to point
+  the importer and `reload_data` at a different folder.
 
 ## MCP tools
 

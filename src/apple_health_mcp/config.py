@@ -15,15 +15,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # DuckDB database file. Overridable for tests via HEALTH_DB.
 DB_PATH = Path(os.environ.get("HEALTH_DB", PROJECT_ROOT / "data" / "health.duckdb"))
 
-# Folder the iPhone Shortcuts automation drops export archives into, kept in
-# sync to the Mac by iCloud Drive. Overridable via HEALTH_EXPORT_DIR.
-DEFAULT_EXPORT_DIR = (
-    Path.home()
-    / "Library"
-    / "Mobile Documents"
-    / "com~apple~CloudDocs"
-    / "AppleHealthExport"
-)
+# Folder the Health export archive is dropped into. Overridable via
+# HEALTH_EXPORT_DIR.
+DEFAULT_EXPORT_DIR = Path.home() / "Documents" / "AppleHealthExport"
 EXPORT_DIR = Path(os.environ.get("HEALTH_EXPORT_DIR", DEFAULT_EXPORT_DIR))
 
 # Where the import pipeline records the last archive it processed, so a reload

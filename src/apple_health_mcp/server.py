@@ -286,8 +286,9 @@ def run_sql(query: str) -> dict:
 
 
 @mcp.tool(annotations=WRITE,
-          description="Import the newest Apple Health export from the iCloud "
-                      "drop-folder into the database right now, so data you "
+          description="Import the newest Apple Health export from the "
+                      "drop-folder (~/Documents/AppleHealthExport) into the "
+                      "database right now, so data you "
                       "just exported from the iPhone Health app becomes "
                       "queryable. Call this after the user says they exported "
                       "fresh data. Idempotent — re-importing the same "

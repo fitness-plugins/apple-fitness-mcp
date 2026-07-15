@@ -170,9 +170,10 @@ def reload(target: str | None = None, *, force: bool = False) -> dict:
 
         if archive is None or not Path(archive).exists():
             return {"status": "empty",
-                    "message": "No export .zip found in the watched folder. "
-                               "Export from the iPhone Health app and save it "
-                               "into iCloud Drive / AppleHealthExport first.",
+                    "message": "No export .zip found in the drop-folder. "
+                               "Export from the iPhone Health app and put the "
+                               "export.zip into ~/Documents/AppleHealthExport "
+                               "first.",
                     "export_dir": str(config.EXPORT_DIR),
                     "totals": _current_totals()}
 

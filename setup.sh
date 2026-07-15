@@ -14,7 +14,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 
 VENV_PYTHON="$PROJECT_ROOT/.venv/bin/python"
-EXPORT_DIR="$HOME/Library/Mobile Documents/com~apple~CloudDocs/AppleHealthExport"
+EXPORT_DIR="$HOME/Documents/AppleHealthExport"
 CLAUDE_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
 LOG_DIR="$PROJECT_ROOT/logs"
 
@@ -46,8 +46,8 @@ mkdir -p "$LOG_DIR" "$PROJECT_ROOT/data"
 uv run python -m apple_health_mcp.import_pipeline || die "schema init / import failed"
 ok "DuckDB schema ready at data/health.duckdb"
 
-# --- 3. iCloud export folder -------------------------------------------------
-bold "[3/6] Ensuring iCloud export drop-folder exists"
+# --- 3. export drop-folder ---------------------------------------------------
+bold "[3/6] Ensuring export drop-folder exists"
 mkdir -p "$EXPORT_DIR" || die "could not create export folder: $EXPORT_DIR"
 ok "drop exports here: $EXPORT_DIR"
 
@@ -94,8 +94,10 @@ ok "MCP server registered in Claude Desktop and verified responding"
 ok "Claude Desktop restarted"
 echo
 bold "How data flows (nothing runs in the background):"
-echo "  1. iPhone Health app → Export All Health Data → Save to Files →"
-echo "     iCloud Drive / AppleHealthExport"
+echo "  1. iPhone Health app → Export All Health Data → get the export.zip into:"
+echo "       $EXPORT_DIR"
+echo "     (AirDrop it to the Mac, or if ~/Documents is in iCloud, Save to Files"
+echo "      → iCloud Drive → Documents → AppleHealthExport)"
 echo "  2. Then import it, whichever you prefer:"
 echo "       • ask Claude:  \"reload my health data\"  (runs the reload_data tool)"
 echo "       • or run:      uv run apple-health-import"
