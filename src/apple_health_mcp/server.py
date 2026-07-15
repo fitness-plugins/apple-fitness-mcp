@@ -155,6 +155,38 @@ def get_heart_rate(start_date: Optional[str] = None,
     return _series("heart_rate", start_date, end_date, agg="avg")
 
 
+@mcp.tool(annotations=RO,
+          description="Raw individual heart-rate readings (bpm), one row per "
+                      "sample, sorted by timestamp — no aggregation (use "
+                      "get_heart_rate for daily avg/min/max). Optional "
+                      "start_date/end_date select a single day or a wider range; "
+                      "readings are deduplicated by source. Capped at `limit` "
+                      "rows (default 2000, oldest-first); a dense day can hold "
+                      "thousands of samples, so narrow the range or raise limit "
+                      "if truncated.")
+def get_heart_rate_raw(start_date: Optional[str] = None,
+                       end_date: Optional[str] = None,
+                       limit: int = 2000) -> dict:
+    _ensure_ready()
+    params: list = []
+    where = _date_filter("start_ts", start_date, end_date, params)
+    where = (where + " AND " if where else " WHERE ") + "type = 'heart_rate'"
+    lim = max(1, min(int(limit), 20000))
+    rows = _q(
+        "SELECT start_ts, round(value, 0) AS bpm, source_name "
+        f"FROM records_dedup{where} ORDER BY start_ts LIMIT {lim + 1}",
+        tuple(params),
+    )
+    truncated = len(rows) > lim
+    rows = rows[:lim]
+    note = "Raw per-sample heart rate, sorted by time."
+    if truncated:
+        note += (f" Truncated to {lim} rows — narrow the date range or raise "
+                 "limit to see the rest.")
+    return {"count": len(rows), "truncated": truncated, "readings": rows,
+            "note": note}
+
+
 @mcp.tool(annotations=RO, description="Daily heart-rate variability (HRV SDNN, ms).")
 def get_hrv(start_date: Optional[str] = None,
             end_date: Optional[str] = None) -> dict:

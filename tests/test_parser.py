@@ -217,6 +217,31 @@ def test_get_sleep_wake_day_and_filter_consistency(sandbox):
     assert server.get_sleep("2024-05-01", "2024-05-01")["nights"] == []
 
 
+def test_get_heart_rate_raw(sandbox):
+    from apple_health_mcp import server
+
+    server._schema_ready = False  # re-init against this sandbox DB
+    archive = _write_zip(config.EXPORT_DIR, SAMPLE_XML)
+    import_pipeline.import_archive(archive)
+    server._schema_ready = False
+
+    # SAMPLE_XML has two HR readings at the same instant (Watch 72, iPhone 99);
+    # the raw tool returns deduplicated per-sample rows sorted by time.
+    r = server.get_heart_rate_raw()
+    assert r["count"] == 1
+    assert r["truncated"] is False
+    assert r["readings"][0]["bpm"] == 72          # Watch wins the dedup
+    assert "source_name" in r["readings"][0]
+
+    # Date filter selects the reading's day; another day returns nothing.
+    assert server.get_heart_rate_raw("2024-05-01", "2024-05-01")["count"] == 1
+    assert server.get_heart_rate_raw("2024-05-02", "2024-05-02")["count"] == 0
+
+    # limit caps the rows and flags truncation.
+    capped = server.get_heart_rate_raw(limit=0)   # clamped to >=1
+    assert capped["count"] == 1 and capped["truncated"] is False
+
+
 def test_empty_database_is_queryable(sandbox):
     # No archive imported: schema must still initialize and queries return empty.
     con = storage.connect()
