@@ -13,7 +13,7 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from . import analytics, config, import_pipeline, storage
+from . import analytics, config, import_pipeline, scoring, storage
 
 mcp = FastMCP("apple-health")
 
@@ -582,6 +582,515 @@ def _training_daily(start_date, end_date, hr_max, rest) -> list[dict]:
         out.append({"date": d["date"], "load": round(d["load"], 1),
                     "workouts": d["workouts"], "method": method})
     return out
+
+
+# --- recovery & readiness -------------------------------------------------------
+
+# Recovery physiological metrics: sub-score name -> underlying record type.
+_RECOVERY_METRICS = {
+    "hrv": "hrv",
+    "sleeping_hr": "heart_rate",
+    "resp": "respiratory_rate",
+    "temp": "sleeping_wrist_temperature",
+}
+# Per-metric extraction strategy (a data-layer concern, not scoring math):
+#   "sleep_window"    — average the metric strictly inside each night's sleep span,
+#     so daytime activity doesn't pollute the baseline (HRV/SDNN, resp rate, wrist
+#     temp are sampled through the night).
+#   "stage_restricted" — our own sleeping HR: the lowest *sustained* 5-min window of
+#     heart_rate taken only from core/deep/rem segments (NOT Apple's opaque daily
+#     resting_heart_rate, and NOT a raw p5 over the wake-to-wake window that an
+#     awakening or gap would corrupt). See _sleeping_hr_series.
+_METRIC_SOURCE = {
+    "hrv": "sleep_window",
+    "sleeping_hr": "stage_restricted",
+    "resp": "sleep_window",
+    "temp": "sleep_window",
+}
+# Sleeping-HR extraction knobs (data-layer, calibrated to Apple's ~1 sample / 5 min
+# overnight cadence). The rolling window smooths single low outliers; the gate
+# keeps a thin/gappy night from polluting the baseline.
+SLEEPING_HR_WINDOW_MIN = 5           # rolling-average window (minutes, forward)
+SLEEPING_HR_MIN_SAMPLES_PER_WINDOW = 2  # a window needs >= this many samples
+SLEEPING_HR_MIN_ASLEEP_H = 3.0       # gate: >= this many hours in core/deep/rem
+SLEEPING_HR_MIN_VALID_WINDOWS = 5    # gate: >= this many valid rolling windows
+SLEEPING_HR_FALLBACK_PCT = 0.05      # p5 when only generic 'asleep' staging exists
+# The wake-day expression shared with get_sleep (18:00->18:00 boundary); nights
+# line up with that tool so a recovery date matches the sleep you woke from.
+_NIGHT_EXPR = "(start_ts + INTERVAL 6 HOUR)::DATE"
+# Sleep stages that count as the actual asleep window (in_bed brackets it).
+_ASLEEP_STAGES = ("asleep", "core", "deep", "rem")
+# Trailing baseline window per metric, excluding the target day. Calibration knob.
+BASELINE_WINDOW_DAYS = 28
+# Minimum days of history before a baseline is trustworthy (WHOOP-style cold
+# start). Below this the tools still compute but report state='calibrating'.
+MIN_HISTORY_DAYS = 14
+# Minimum baseline samples for a metric's z-score to be trusted. A metric scored
+# on fewer than this is still returned, but flagged low_confidence so the caller
+# knows the baseline is thin/noisy (Apple writes HRV etc. sparsely). Finer-grained
+# than the state field, which it does not affect.
+MIN_BASELINE_N = 10
+# Bedtime-regularity lookback (nights) and recovery-time heuristic constants.
+REGULARITY_WINDOW_NIGHTS = 14
+RECOVERY_TIME_PER_TRIMP_H = 0.25   # recovery hours a hard session "owes"
+RECOVERY_TIME_MAX_H = 48.0
+
+
+def _night_metric_series(metric_type: str, start_night: str,
+                         end_night: str) -> list[dict]:
+    """Per-night average of `metric_type` inside each night's sleep window.
+
+    Nights are the sleep table's wake-days; the window is that night's earliest
+    sleep start to its latest sleep end. Nights without the metric come back with
+    value NULL (LEFT JOIN) so callers see the gap. `start_night`/`end_night` are
+    inclusive wake-day bounds (YYYY-MM-DD).
+    """
+    asleep_in = ", ".join(f"'{s}'" for s in _ASLEEP_STAGES + ("in_bed",))
+    rows = _q(
+        "WITH nights AS ("
+        f"  SELECT {_NIGHT_EXPR} AS night, "
+        "    min(start_ts) AS win_start, max(end_ts) AS win_end "
+        f"  FROM sleep WHERE stage IN ({asleep_in}) "
+        f"  GROUP BY night HAVING night >= CAST(? AS DATE) "
+        "    AND night <= CAST(? AS DATE)"
+        ") "
+        "SELECT n.night AS night, avg(r.value) AS value, "
+        "count(r.value) AS samples "
+        "FROM nights n LEFT JOIN records_dedup r "
+        "  ON r.type = ? AND r.start_ts >= n.win_start "
+        "  AND r.start_ts <= n.win_end "
+        "GROUP BY n.night ORDER BY n.night",
+        (start_night, end_night, metric_type))
+    return rows
+
+
+def _sleeping_hr_series(start_night: str, end_night: str) -> list[dict]:
+    """Per-night sleeping heart rate: the lowest *sustained* window of overnight
+    heart_rate, robust to awakenings and gaps by construction.
+
+    Method (per wake-day night, inclusive bounds):
+      1. Stage restriction — keep only heart_rate samples inside core/deep/rem
+         segments (awake / in_bed excluded), so a mid-night awakening drops out.
+      2. Sustained minimum — a forward SLEEPING_HR_WINDOW_MIN rolling average over
+         the retained samples; the night's value is the MIN over windows holding
+         >= SLEEPING_HR_MIN_SAMPLES_PER_WINDOW samples (a lone low blip can't win).
+      3. Validity gate — the night must have >= SLEEPING_HR_MIN_ASLEEP_H hours in
+         core/deep/rem AND >= SLEEPING_HR_MIN_VALID_WINDOWS valid windows, else its
+         value is None (it must not pollute the baseline).
+      4. Fallback — a night with only generic 'asleep' staging (no core/deep/rem)
+         uses p5 of heart_rate over the asleep segments, tagged p5_fallback.
+
+    Each row: {night, value, source, asleep_hours, valid_windows}. `source` is
+    'stage_restricted' or 'p5_fallback'; value is None when a night is gated out.
+    """
+    win = int(SLEEPING_HR_WINDOW_MIN)
+    minspw = int(SLEEPING_HR_MIN_SAMPLES_PER_WINDOW)
+    staged = _q(
+        "WITH seg AS ("
+        f"  SELECT {_NIGHT_EXPR} AS night, start_ts AS s, end_ts AS e, "
+        "    date_diff('second', start_ts, end_ts) AS dur "
+        "  FROM sleep WHERE stage IN ('core','deep','rem')"
+        "), "
+        "asleep AS ("
+        "  SELECT night, sum(dur) / 3600.0 AS asleep_h FROM seg "
+        "  WHERE night >= CAST(? AS DATE) AND night <= CAST(? AS DATE) "
+        "  GROUP BY night"
+        "), "
+        "hr AS ("
+        "  SELECT seg.night AS night, r.start_ts AS ts, r.value AS v "
+        "  FROM records_dedup r JOIN seg "
+        "    ON r.start_ts >= seg.s AND r.start_ts < seg.e "
+        "  WHERE r.type = 'heart_rate' "
+        "    AND seg.night >= CAST(? AS DATE) AND seg.night <= CAST(? AS DATE)"
+        "), "
+        "roll AS ("
+        "  SELECT night, avg(v) OVER w AS win_avg, count(*) OVER w AS win_n "
+        "  FROM hr "
+        f"  WINDOW w AS (PARTITION BY night ORDER BY ts "
+        f"    RANGE BETWEEN CURRENT ROW AND INTERVAL {win} MINUTE FOLLOWING)"
+        ") "
+        "SELECT a.night AS night, a.asleep_h AS asleep_h, "
+        f"  min(roll.win_avg) FILTER (WHERE roll.win_n >= {minspw}) AS shr, "
+        f"  count(*) FILTER (WHERE roll.win_n >= {minspw}) AS valid_windows "
+        "FROM asleep a LEFT JOIN roll ON roll.night = a.night "
+        "GROUP BY a.night, a.asleep_h ORDER BY a.night",
+        (start_night, end_night, start_night, end_night))
+
+    out: list[dict] = []
+    for r in staged:
+        asleep_h = r["asleep_h"] or 0.0
+        vw = r["valid_windows"] or 0
+        valid = (r["shr"] is not None
+                 and asleep_h >= SLEEPING_HR_MIN_ASLEEP_H
+                 and vw >= SLEEPING_HR_MIN_VALID_WINDOWS)
+        out.append({
+            "night": r["night"],
+            "value": r["shr"] if valid else None,
+            "source": "stage_restricted",
+            "asleep_hours": asleep_h,
+            "valid_windows": vw,
+        })
+
+    # Fallback: nights with only generic 'asleep' staging (no core/deep/rem).
+    fb = _q(
+        "WITH staged AS ("
+        f"  SELECT DISTINCT {_NIGHT_EXPR} AS night FROM sleep "
+        "  WHERE stage IN ('core','deep','rem')"
+        "), "
+        "aseg AS ("
+        f"  SELECT {_NIGHT_EXPR} AS night, start_ts AS s, end_ts AS e, "
+        "    date_diff('second', start_ts, end_ts) AS dur "
+        "  FROM sleep WHERE stage = 'asleep'"
+        "), "
+        "asleep AS ("
+        "  SELECT night, sum(dur) / 3600.0 AS asleep_h FROM aseg "
+        "  WHERE night >= CAST(? AS DATE) AND night <= CAST(? AS DATE) "
+        "    AND night NOT IN (SELECT night FROM staged) "
+        "  GROUP BY night"
+        "), "
+        "hr AS ("
+        "  SELECT aseg.night AS night, r.value AS v "
+        "  FROM records_dedup r JOIN aseg "
+        "    ON r.start_ts >= aseg.s AND r.start_ts < aseg.e "
+        "  WHERE r.type = 'heart_rate'"
+        ") "
+        "SELECT a.night AS night, a.asleep_h AS asleep_h, "
+        f"  quantile_cont(hr.v, {SLEEPING_HR_FALLBACK_PCT}) AS shr "
+        "FROM asleep a LEFT JOIN hr ON hr.night = a.night "
+        "GROUP BY a.night, a.asleep_h ORDER BY a.night",
+        (start_night, end_night))
+    for r in fb:
+        asleep_h = r["asleep_h"] or 0.0
+        valid = r["shr"] is not None and asleep_h >= SLEEPING_HR_MIN_ASLEEP_H
+        out.append({
+            "night": r["night"],
+            "value": r["shr"] if valid else None,
+            "source": "p5_fallback",
+            "asleep_hours": asleep_h,
+            "valid_windows": None,
+        })
+
+    out.sort(key=lambda x: str(x["night"]))
+    return out
+
+
+def _metric_series(name: str, metric_type: str, start_night: str,
+                   end_night: str) -> list[dict]:
+    """Dispatch to the extraction strategy declared for `name` in _METRIC_SOURCE."""
+    if _METRIC_SOURCE.get(name) == "stage_restricted":
+        return _sleeping_hr_series(start_night, end_night)
+    return _night_metric_series(metric_type, start_night, end_night)
+
+
+def _sleep_night_stats(start_night: str, end_night: str) -> list[dict]:
+    """Per-night sleep quality inputs (hours asleep, deep+REM fraction, awakenings,
+    bedtime) over an inclusive wake-day range."""
+    asleep_in = ", ".join(f"'{s}'" for s in _ASLEEP_STAGES)
+    rows = _q(
+        f"SELECT {_NIGHT_EXPR} AS night, "
+        "  sum(date_diff('second', start_ts, end_ts)) "
+        f"    FILTER (WHERE stage IN ({asleep_in})) / 3600.0 AS hours_asleep, "
+        "  sum(date_diff('second', start_ts, end_ts)) "
+        "    FILTER (WHERE stage IN ('deep','rem')) / 3600.0 AS deep_rem_h, "
+        "  count(*) FILTER (WHERE stage = 'awake') AS awakenings, "
+        "  min(start_ts) AS bed_start "
+        f"FROM sleep WHERE {_NIGHT_EXPR} >= CAST(? AS DATE) "
+        f"  AND {_NIGHT_EXPR} <= CAST(? AS DATE) "
+        "GROUP BY night ORDER BY night",
+        (start_night, end_night))
+    return rows
+
+
+def _trailing_values(series: list[dict], target_day: str,
+                     window_days: int = BASELINE_WINDOW_DAYS,
+                     key: str = "night", value_key: str = "value") -> list[float]:
+    """Values from the `window_days` before `target_day` (target excluded)."""
+    from datetime import date
+    td = date.fromisoformat(str(target_day))
+    lo = td - timedelta(days=window_days)
+    out: list[float] = []
+    for r in series:
+        d = date.fromisoformat(str(r[key]))
+        if lo <= d < td and r.get(value_key) is not None:
+            out.append(r[value_key])
+    return out
+
+
+def _bedtime_regularity(sleep_rows: list[dict], target_day: str) -> Optional[float]:
+    """SD (minutes) of bedtime over the trailing REGULARITY_WINDOW_NIGHTS.
+
+    Bedtime is measured as minutes past 18:00 (the sleep-day boundary), so a
+    23:30 and a 00:30 bedtime read as 60 min apart rather than wrapping across
+    midnight. Needs >= 2 nights; else None (regularity component omitted)."""
+    from datetime import date
+    td = date.fromisoformat(str(target_day))
+    lo = td - timedelta(days=REGULARITY_WINDOW_NIGHTS)
+    mins: list[float] = []
+    for r in sleep_rows:
+        if r.get("bed_start") is None:
+            continue
+        d = date.fromisoformat(str(r["night"]))
+        if not (lo <= d <= td):
+            continue
+        bt = r["bed_start"]
+        # Minutes past 18:00 local, wrapped into [0, 1440).
+        m = (bt.hour * 60 + bt.minute - 18 * 60) % 1440
+        mins.append(float(m))
+    _, sd = scoring.baseline(mins)
+    return sd if len(mins) >= 2 else None
+
+
+def _latest_recovery_night() -> Optional[str]:
+    rows = _q(f"SELECT max({_NIGHT_EXPR}) AS night FROM sleep")
+    n = rows[0]["night"] if rows else None
+    return str(n) if n else None
+
+
+def _earliest_recovery_night() -> Optional[str]:
+    rows = _q(f"SELECT min({_NIGHT_EXPR}) AS night FROM sleep")
+    n = rows[0]["night"] if rows else None
+    return str(n) if n else None
+
+
+def _compute_recovery(date: Optional[str] = None) -> dict:
+    """Shared recovery computation used by get_recovery and get_readiness."""
+    _ensure_ready()
+    target = date or _latest_recovery_night()
+    if not target:
+        return {"date": date, "state": "insufficient_data", "score": None,
+                "band": None, "subscores": {}, "metrics": {},
+                "low_confidence_metrics": [],
+                "note": "No sleep data — recovery needs nightly sleep windows."}
+
+    earliest = _earliest_recovery_night()
+    history_days = 0
+    if earliest:
+        from datetime import date as _date
+        history_days = (_date.fromisoformat(target)
+                        - _date.fromisoformat(earliest)).days
+
+    win_start = (_to_dt(target).date()
+                 - timedelta(days=BASELINE_WINDOW_DAYS)).isoformat()
+
+    # Physiological metrics: today's value (sourced per _METRIC_SOURCE) vs its own
+    # trailing baseline. low_confidence flags a thin baseline (see MIN_BASELINE_N).
+    subscores: dict[str, Optional[float]] = {}
+    metrics: dict[str, dict] = {}
+    low_confidence_metrics: list[str] = []
+    # sleeping_hr reuses rhr_score's sign convention (higher HR than baseline
+    # is worse); the metric name and extraction differ, the math does not.
+    score_fns = {"hrv": scoring.hrv_score, "sleeping_hr": scoring.rhr_score,
+                 "resp": scoring.resp_score, "temp": scoring.temp_score}
+    for name, rtype in _RECOVERY_METRICS.items():
+        series = _metric_series(name, rtype, win_start, target)
+        target_row = next((r for r in series if str(r["night"]) == target), None)
+        today = target_row["value"] if target_row else None
+        base_vals = _trailing_values(series, target)
+        mean, sd = scoring.baseline(base_vals)
+        z = scoring.zscore(today, mean, sd)
+        sub = score_fns[name](z)
+        subscores[name] = sub
+        # Only a scored metric with a thin baseline is "low confidence"; a metric
+        # with no value at all is simply absent (omitted from the weighted mean).
+        low_conf = sub is not None and len(base_vals) < MIN_BASELINE_N
+        if low_conf:
+            low_confidence_metrics.append(name)
+        block = {
+            "metric": rtype,
+            "source": _METRIC_SOURCE[name],
+            "today": round(today, 2) if today is not None else None,
+            "baseline_mean": round(mean, 2) if mean is not None else None,
+            "baseline_sd": round(sd, 2) if sd else None,
+            "baseline_n": len(base_vals),
+            "z": round(z, 2) if z is not None else None,
+            "subscore": sub,
+            "low_confidence": low_conf,
+        }
+        # Sleeping HR carries its actual per-night source + how much asleep data
+        # the night had, so a thin/gated night is visible to the caller.
+        if name == "sleeping_hr" and target_row:
+            block["source"] = target_row.get("source", _METRIC_SOURCE[name])
+            ah = target_row.get("asleep_hours")
+            block["asleep_hours"] = round(ah, 2) if ah is not None else None
+            block["valid_windows"] = target_row.get("valid_windows")
+        metrics[name] = block
+
+    # Sleep sub-score from the night's stage breakdown.
+    sleep_rows = _sleep_night_stats(win_start, target)
+    tonight = next((r for r in sleep_rows if str(r["night"]) == target), None)
+    if tonight:
+        hours = tonight["hours_asleep"]
+        deep_rem = tonight["deep_rem_h"]
+        # A night with no deep/rem staging (e.g. only generic 'asleep') has no
+        # deep_rem fraction — omit that component rather than crash.
+        deep_rem_frac = (deep_rem / hours) if (hours and deep_rem is not None) \
+            else None
+        regularity = _bedtime_regularity(sleep_rows, target)
+        sleep_sub = scoring.sleep_score(
+            hours, need=None, deep_rem_frac=deep_rem_frac,
+            awakenings=tonight["awakenings"], regularity=regularity)
+        subscores["sleep"] = sleep_sub
+        metrics["sleep"] = {
+            "hours_asleep": round(hours, 2) if hours else None,
+            "deep_rem_frac": round(deep_rem_frac, 3)
+            if deep_rem_frac is not None else None,
+            "awakenings": tonight["awakenings"],
+            "bedtime_regularity_min": round(regularity, 1)
+            if regularity is not None else None,
+            "subscore": sleep_sub,
+        }
+    else:
+        subscores["sleep"] = None
+
+    rec = scoring.recovery_score(subscores)
+    present = [k for k, v in subscores.items() if v is not None]
+    if not present:
+        state = "insufficient_data"
+    elif history_days < MIN_HISTORY_DAYS:
+        state = "calibrating"
+    else:
+        state = "ok"
+    return {
+        "date": target,
+        "state": state,
+        "history_days": history_days,
+        "score": rec["score"],
+        "band": rec["band"],
+        "contributors": rec["contributors"],
+        "subscores": subscores,
+        "metrics": metrics,
+        "low_confidence_metrics": low_confidence_metrics,
+        "baseline_window_days": BASELINE_WINDOW_DAYS,
+    }
+
+
+@mcp.tool(annotations=RO,
+          description="Daily Recovery score (0-100): how recovered the body is, "
+                      "scored against the user's own rolling baseline (never "
+                      "population norms — Apple HRV is SDNN). Combines nightly HRV, "
+                      "sleeping HR (lowest sustained overnight window from "
+                      "core/deep/rem stages), respiratory rate, wrist temperature "
+                      "and sleep quality, weighted and "
+                      "renormalized over whatever metrics are present. Defaults to "
+                      "the latest night with data. Bands: green >=67, yellow "
+                      "34-66, red <34. state is 'ok', 'calibrating' (<14 days "
+                      "history) or 'insufficient_data'. Returns each sub-score "
+                      "with its today-value, baseline mean and z.")
+def get_recovery(date: Optional[str] = None) -> dict:
+    out = _compute_recovery(date)
+    note = ("Recovery vs personal baseline over a "
+            f"{BASELINE_WINDOW_DAYS}-day trailing window. 50 == on baseline.")
+    if out["state"] == "calibrating":
+        note += (f" Only {out.get('history_days', 0)} days of history "
+                 f"(< {MIN_HISTORY_DAYS}) — baseline still calibrating.")
+    elif out["state"] == "insufficient_data":
+        note += " Not enough data to score recovery yet."
+    note += _low_confidence_note(out.get("low_confidence_metrics", []))
+    out["note"] = note
+    return out
+
+
+def _low_confidence_note(names: list[str]) -> str:
+    """Trailing note fragment when some baselines are thin (empty if none)."""
+    if not names:
+        return ""
+    return (f" {', '.join(names)} baseline(s) are thin (< {MIN_BASELINE_N} "
+            "samples) — those sub-scores are provisional.")
+
+
+def _recovery_time_hours(target: str, hr_max: float, rest: float) -> float:
+    """Rough unresolved recovery time (hours) owed by the last hard session on or
+    before `target`: its load scaled by RECOVERY_TIME_PER_TRIMP_H, minus the hours
+    elapsed to `target` morning (08:00 local). Clamped to [0, RECOVERY_TIME_MAX_H].
+    """
+    rows = _q(
+        "SELECT start_ts, end_ts, duration, avg_hr, energy "
+        "FROM workouts WHERE end_ts <= CAST(? AS TIMESTAMPTZ) + INTERVAL 1 DAY "
+        "ORDER BY end_ts DESC LIMIT 1",
+        (target,))
+    if not rows:
+        return 0.0
+    w = rows[0]
+    load = analytics.trimp(w["duration"] or 0, w["avg_hr"], rest, hr_max)
+    if load is None:
+        load = (w["energy"] or 0) * analytics.ENERGY_LOAD_K
+    needed = min(RECOVERY_TIME_MAX_H, load * RECOVERY_TIME_PER_TRIMP_H)
+    morning = _to_dt(target).replace(hour=8, minute=0, second=0)
+    end = w["end_ts"]
+    if end.tzinfo is not None and morning.tzinfo is None:
+        morning = morning.replace(tzinfo=end.tzinfo)
+    elapsed_h = max(0.0, (morning - end).total_seconds() / 3600.0)
+    return max(0.0, needed - elapsed_h)
+
+
+def _acwr_for_date(target: str) -> Optional[dict]:
+    """The ACWR entry (ratio + acute load + flag) for `target`, seeded with the
+    prior 28 days so acute/chronic reflect real history."""
+    hr_max, _ = analytics.resolve_max_hr(_q, None)
+    rest, _ = analytics.resolve_resting_hr(_q, None)
+    calc_start = (_to_dt(target).date() - timedelta(days=28)).isoformat()
+    daily_ext = _training_daily(calc_start, target, hr_max, rest)
+    if not daily_ext:
+        return None
+    first = min(d["date"] for d in daily_ext)
+    span = analytics.daily_date_range(_to_dt(first), _to_dt(target))
+    load_by_day = {d["date"]: d["load"] for d in daily_ext}
+    dates = [str(d) for d in span]
+    loads = [load_by_day.get(str(d), 0.0) for d in span]
+    series = analytics.acwr(dates, loads, min_history_date=_dataset_start())
+    return next((a for a in series if a["date"] == target), None)
+
+
+@mcp.tool(annotations=RO,
+          description="Daily Readiness score (0-100): Recovery adjusted down for "
+                      "accumulated training load. Builds on get_recovery, then "
+                      "applies a load penalty from ACWR (no penalty in the 0.8-1.3 "
+                      "sweet spot, ramping up above 1.5) and recovery still owed "
+                      "from the last hard session. Defaults to the latest night "
+                      "with data. Returns the readiness score+band, the recovery "
+                      "it built on, the load inputs (ACWR, acute load, recovery "
+                      "time), and a short training recommendation.")
+def get_readiness(date: Optional[str] = None) -> dict:
+    _ensure_ready()
+    rec = _compute_recovery(date)
+    target = rec["date"]
+    if not target or rec["score"] is None:
+        out = scoring.readiness_score(None, None)
+        return {"date": target, "state": rec["state"], **out,
+                "recovery": rec,
+                "low_confidence_metrics": rec.get("low_confidence_metrics", []),
+                "note": "Readiness needs a recovery score first."}
+
+    acwr_entry = _acwr_for_date(target)
+    acwr_val = acwr_entry["acwr"] if acwr_entry else None
+    acute_load = acwr_entry["acute_7d"] if acwr_entry else None
+    hr_max, _ = analytics.resolve_max_hr(_q, None)
+    rest, _ = analytics.resolve_resting_hr(_q, None)
+    rec_time = _recovery_time_hours(target, hr_max, rest)
+
+    out = scoring.readiness_score(rec["score"], acwr_val,
+                                  acute_load=acute_load,
+                                  recovery_time_hours=rec_time)
+    return {
+        "date": target,
+        "state": rec["state"],
+        "score": out["score"],
+        "band": out["band"],
+        "recovery_score": rec["score"],
+        "recovery_band": rec["band"],
+        "load": {
+            "acwr": acwr_val,
+            "acwr_flag": acwr_entry["flag"] if acwr_entry else None,
+            "acute_7d": acute_load,
+            "recovery_time_hours": round(rec_time, 1),
+            "penalty": out["penalty"],
+        },
+        "recommendation": out["recommendation"],
+        "recovery": rec,
+        "low_confidence_metrics": rec.get("low_confidence_metrics", []),
+        "note": ("Readiness = Recovery - load penalty (ACWR + recovery owed)."
+                 + _low_confidence_note(rec.get("low_confidence_metrics", []))),
+    }
 
 
 # --- read-only SQL escape hatch -------------------------------------------------

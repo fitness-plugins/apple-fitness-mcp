@@ -34,6 +34,7 @@ TYPE_ALIASES = {
     "HKQuantityTypeIdentifierBloodPressureDiastolic": "blood_pressure_diastolic",
     "HKQuantityTypeIdentifierBloodGlucose": "blood_glucose",
     "HKQuantityTypeIdentifierBodyTemperature": "body_temperature",
+    "HKQuantityTypeIdentifierAppleSleepingWristTemperature": "sleeping_wrist_temperature",
     "HKQuantityTypeIdentifierDietaryEnergyConsumed": "dietary_energy",
     "HKQuantityTypeIdentifierDietaryWater": "water",
     "HKCategoryTypeIdentifierSleepAnalysis": "sleep_analysis",
