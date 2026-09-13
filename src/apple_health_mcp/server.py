@@ -6,6 +6,7 @@ client over stdio.
 """
 from __future__ import annotations
 
+import atexit
 import math
 import re
 from datetime import timedelta
@@ -14,7 +15,8 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from . import analytics, config, import_pipeline, scoring, storage
+from . import (analytics, config, import_pipeline, scoring, storage,
+               sync_import, sync_pairing, sync_receiver, sync_spool)
 
 mcp = FastMCP("apple-health")
 
@@ -1229,10 +1231,305 @@ def reload_data(force: bool = False) -> dict:
     return import_pipeline.reload(force=force)
 
 
+# --- LAN delta sync from the iPhone app ---------------------------------------
+# The receiver (sync_receiver) runs on a background thread in THIS process, so
+# receive and import never contend for DuckDB's single writer. The accepted
+# consequence: the phone can only deliver while Claude Desktop is running. No
+# data is lost when it is not — the app advances its HealthKit anchor only
+# after a 200, so the samples simply arrive with the next successful sync.
+
+_QR_BLOCKS = ("█", "▀", "▄", " ")   # full, upper, lower, empty
+
+
+def _qr_matrix(data: str):
+    """QR modules for `data`, with quiet zone, as rows of 0/1. Needs segno."""
+    import segno
+
+    qr = segno.make(data, error="m", micro=False)
+    try:
+        rows = [list(row) for row in qr.matrix_iter(border=4)]
+    except Exception:                       # older/newer segno: build the border
+        body = [list(row) for row in qr.matrix]
+        width = len(body[0]) + 8
+        rows = [[0] * width for _ in range(4)]
+        rows += [[0] * 4 + row + [0] * 4 for row in body]
+        rows += [[0] * width for _ in range(4)]
+    return rows, getattr(qr, "version", None), getattr(qr, "error", None)
+
+
+def _qr_lines(rows, invert: bool = False) -> list[str]:
+    """Render 0/1 rows as half-block text: one character = 1x2 modules.
+
+    Half blocks keep the modules square in a monospace font, which a scanner
+    needs. Dark modules are drawn in the *foreground* colour, so the code reads
+    correctly on a light background; `invert=True` swaps it for a dark one.
+    """
+    full, upper, lower, empty = _QR_BLOCKS
+    out = []
+    width = max(len(r) for r in rows)
+    for y in range(0, len(rows), 2):
+        top = rows[y]
+        bottom = rows[y + 1] if y + 1 < len(rows) else [0] * width
+        line = []
+        for x in range(width):
+            t = bool(top[x] if x < len(top) else 0) ^ invert
+            b = bool(bottom[x] if x < len(bottom) else 0) ^ invert
+            line.append(full if t and b else upper if t else lower if b else empty)
+        out.append("".join(line))
+    return out
+
+
+def _listener_port() -> tuple[Optional[int], Optional[str]]:
+    """(port, warning) — the port the pairing payload should advertise."""
+    receiver = sync_receiver.get_receiver()
+    if receiver is not None and receiver.running and receiver.port:
+        return receiver.port, None
+    detail = (receiver.listen_error if receiver is not None
+              else sync_receiver.start_error()) or "the listener is not running"
+    return None, (f"The sync listener is not up ({detail}), so this payload "
+                  "carries no usable port. Fix it, restart Claude Desktop, and "
+                  "call pair_device() again — the token itself stays valid.")
+
+
+@mcp.tool(annotations=WRITE,
+          description="Pair the Readiness iPhone app with this Mac for direct "
+                      "LAN sync (the phone pushes HealthKit deltas straight "
+                      "into the database, instead of the manual full export). "
+                      "Generates the shared token if there is none, stores it "
+                      "0600, and returns the pairing payload both as a QR to "
+                      "scan and as raw JSON for manual entry. Safe to call "
+                      "again — it re-displays the existing pairing. "
+                      "rotate=true issues a NEW token and immediately locks out "
+                      "the phone paired now, which must scan again. "
+                      "invert=true redraws the QR for a dark background if a "
+                      "scanner will not read the first one.")
+def pair_device(rotate: bool = False, invert: bool = False) -> dict:
+    existed = sync_pairing.is_paired()
+    try:
+        pairing = sync_pairing.ensure(rotate=rotate)
+    except OSError as exc:
+        return {"status": "error",
+                "error": f"Could not write the pairing file: {exc}",
+                "path": str(config.sync_pairing_path())}
+    port, warning = _listener_port()
+    payload = sync_pairing.pairing_payload(port or 0, pairing=pairing)
+    payload_json = sync_pairing.pairing_json(port or 0, pairing=pairing)
+
+    qr_lines: list[str] = []
+    qr_error = None
+    try:
+        rows, version, _level = _qr_matrix(payload_json)
+        qr_lines = _qr_lines(rows, invert=invert)
+    except ImportError as exc:
+        qr_error = (f"QR rendering needs the `segno` package ({exc}); run "
+                    "`uv sync` in the project. Type the JSON payload into the "
+                    "app's manual field instead.")
+        version = None
+    except Exception as exc:                      # never fail the pairing itself
+        qr_error = f"QR rendering failed ({exc!r}); use the JSON payload."
+        version = None
+
+    result = {
+        "status": "rotated" if (rotate and existed) else
+                  ("existing" if existed and not rotate else "paired"),
+        "device_id": pairing["device_id"],
+        "token_fingerprint": sync_pairing.fingerprint(pairing["token"]),
+        "pairing_json": payload_json,
+        "payload": payload,
+        "qr": "\n".join(qr_lines) if qr_lines else None,
+        "qr_version": version,
+        "qr_error": qr_error,
+        "listener": {"port": port, "host": payload["host"],
+                     "url": (sync_receiver.get_receiver().base_url()
+                             if sync_receiver.get_receiver() else None)},
+        "pairing_file": str(config.sync_pairing_path()),
+        "next_steps": [
+            "In the Readiness app, tap Pair and scan the QR (or paste the JSON).",
+            "iOS will ask for Local Network permission the first time — it must "
+            "be allowed or discovery silently finds nothing.",
+            "Bring the app to the foreground to push; then call "
+            "import_from_app() here.",
+        ],
+    }
+    if warning:
+        result["warning"] = warning
+    if rotate and existed:
+        result["note"] = ("The previous token is dead. The phone will get 401s "
+                          "until it scans this code.")
+    if qr_lines and not invert:
+        result["qr_note"] = ("If the scanner will not read it, the chat theme "
+                             "is inverting the code — call "
+                             "pair_device(invert=true).")
+    return result
+
+
+@mcp.tool(annotations=WRITE,
+          description="Import the delta batches the iPhone app has already "
+                      "pushed to this Mac (they are spooled in "
+                      "~/Documents/AppleHealthExport/deltas/pending) into the "
+                      "database. This is the fast path — seconds, not the "
+                      "minutes a full export re-parse takes. Idempotent: the "
+                      "same batch imported twice adds nothing. With "
+                      "wait_seconds>0 it polls the spool first, so you can say "
+                      "'open the Readiness app now' and block briefly for the "
+                      "result (cap 300s). Returns per-table added counts. "
+                      "Status: 'imported', 'partial', 'empty', 'busy', "
+                      "'error'. For a full export .zip use reload_data "
+                      "instead.")
+def import_from_app(wait_seconds: int = 0) -> dict:
+    _ensure_ready()
+    try:
+        result = sync_import.import_pending(wait_seconds=wait_seconds)
+    except Exception as exc:                      # never surface a traceback
+        return {"status": "error", "error": f"Delta import failed: {exc!r}",
+                "hint": "Call sync_status() — the batches are still spooled."}
+    if result.get("status") == "empty":
+        receiver = sync_receiver.get_receiver()
+        result["listener_running"] = bool(receiver and receiver.running)
+        result["paired"] = sync_pairing.is_paired()
+        if not result["paired"]:
+            result["hint"] = ("No device is paired yet — call pair_device() and "
+                              "scan the QR with the Readiness app.")
+        elif not result["listener_running"]:
+            result["hint"] = ("The listener is not running, so the phone cannot "
+                              "deliver. See sync_status().")
+    return result
+
+
+def _latest_samples(limit: int = 60) -> dict:
+    """Newest sample per metric plus table totals, from one read-only handle."""
+    out: dict[str, Any] = {}
+    con = storage.connect_readonly()
+    try:
+        # The limit is interpolated, not bound: a parameter inside LIMIT is
+        # not portable across DuckDB builds (cf. the `hours` reserved-word
+        # trap), and this one is an int we clamp ourselves.
+        cap = max(1, min(int(limit), 500))
+        cur = con.execute(
+            "SELECT type AS metric, max(start_ts) AS last_sample, "
+            "count(*) AS rows_total FROM records GROUP BY type "
+            f"ORDER BY last_sample DESC LIMIT {cap}")
+        cols = [d[0] for d in cur.description]
+        out["latest_per_type"] = [
+            {c: (v.isoformat() if hasattr(v, "isoformat") else v)
+             for c, v in zip(cols, row)} for row in cur.fetchall()]
+        for name, table in (("workouts", "workouts"), ("sleep", "sleep"),
+                            ("workout_events", "workout_events")):
+            row = con.execute(
+                f"SELECT max(start_ts) FROM {table}").fetchone()
+            value = row[0] if row else None
+            out[f"latest_{name}"] = (value.isoformat()
+                                     if hasattr(value, "isoformat") else value)
+        out["totals"] = storage.table_counts(con)
+        out["last_delta_import"] = sync_import.last_delta_import(con)
+    finally:
+        con.close()
+    return out
+
+
+@mcp.tool(annotations=RO,
+          description="Diagnose LAN sync with the iPhone app in one call: is "
+                      "the listener bound and on which port, is Bonjour "
+                      "advertising, is a device paired, when did the last "
+                      "batch arrive and from where, how many batches are "
+                      "waiting to be imported, how many failed, and the newest "
+                      "sample timestamp per metric now in the database. Use it "
+                      "whenever the user says data did not arrive — it also "
+                      "returns a plain-language diagnosis of what is wrong and "
+                      "what to do next.")
+def sync_status() -> dict:
+    _ensure_ready()
+    receiver = sync_receiver.get_receiver()
+    listener = (receiver.status() if receiver is not None else
+                {"running": False, "port": None,
+                 "error": sync_receiver.start_error() or
+                          "the receiver was never started (is this an old "
+                          "server process? restart Claude Desktop)",
+                 "bonjour": {"advertising": False}, "counters": {}, "last": {}})
+    pairing = sync_pairing.load()
+    spool = sync_spool.Spool()
+    try:
+        spool_stats = spool.stats()
+    except OSError as exc:
+        spool_stats = {"error": str(exc), "dir": str(spool.root)}
+    try:
+        data = _latest_samples()
+    except Exception as exc:
+        data = {"error": f"Could not read the database: {exc}"}
+
+    counters = listener.get("counters") or {}
+    last = listener.get("last") or {}
+    notes: list[str] = []
+    if not pairing:
+        notes.append("No device is paired. Call pair_device() and scan the QR "
+                     "with the Readiness app.")
+    if not listener.get("running"):
+        notes.append(f"The listener is NOT running ({listener.get('error')}). "
+                     "Nothing the phone sends can arrive until it is.")
+    elif not (listener.get("bonjour") or {}).get("advertising"):
+        notes.append("Bonjour is not advertising "
+                     f"({(listener.get('bonjour') or {}).get('error')}). "
+                     "Discovery will find nothing; enter the host and port from "
+                     "pair_device() manually in the app.")
+    if listener.get("running") and not counters.get("requests"):
+        notes.append("No request has reached this listener at all. Check the "
+                     "phone is on the same Wi-Fi, that iOS Local Network "
+                     "permission was granted to the app, and that the app was "
+                     "brought to the foreground.")
+    if counters.get("unauthorized") and not counters.get("accepted"):
+        notes.append("Requests arrived but every one was rejected as "
+                     "unauthenticated — the phone is holding an old token. "
+                     "Call pair_device(rotate=true) and scan again.")
+    if counters.get("malformed"):
+        notes.append(f"{counters['malformed']} request(s) were rejected as "
+                     f"malformed; the last was {last.get('malformed')}.")
+    if spool_stats.get("pending"):
+        notes.append(f"{spool_stats['pending']} batch(es) are received but not "
+                     "imported — call import_from_app().")
+    if spool_stats.get("failed"):
+        notes.append(f"{spool_stats['failed']} batch(es) failed to import and "
+                     f"are kept in {spool_stats.get('dir')}/failed.")
+    if not notes:
+        notes.append("Sync looks healthy. Remember the receiver lives inside "
+                     "this MCP process: the phone can only deliver while Claude "
+                     "Desktop is running (nothing is lost meanwhile — the app "
+                     "advances its HealthKit anchor only after a 200).")
+
+    return {
+        "listener": listener,
+        "pairing": {
+            "paired": bool(pairing),
+            "device_id": (pairing or {}).get("device_id"),
+            "token_fingerprint": sync_pairing.fingerprint((pairing or {}).get("token")),
+            "created_at": (pairing or {}).get("created_at"),
+            "rotated_at": (pairing or {}).get("rotated_at"),
+            "file": str(config.sync_pairing_path()),
+        },
+        "spool": spool_stats,
+        "data": data,
+        "diagnosis": notes,
+    }
+
+
+def _start_sync_listener() -> None:
+    """Bring up the LAN delta receiver. A failure here must never stop the
+    MCP server from serving queries — it degrades to "listener unavailable",
+    reported by sync_status()."""
+    try:
+        sync_receiver.start_receiver()
+        atexit.register(sync_receiver.stop_receiver)
+    except Exception:                       # pragma: no cover - belt and braces
+        pass
+
+
 def main() -> None:
     config.ensure_dirs()
     _ensure_ready()
-    mcp.run()
+    _start_sync_listener()
+    try:
+        mcp.run()
+    finally:
+        sync_receiver.stop_receiver()
 
 
 if __name__ == "__main__":

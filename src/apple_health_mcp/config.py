@@ -54,3 +54,62 @@ def ensure_dirs() -> None:
     """Create the directories the pipeline writes to."""
     for d in (DB_PATH.parent, STATE_DIR, LOG_DIR, EXPORT_DIR):
         d.mkdir(parents=True, exist_ok=True)
+
+
+# --- LAN delta sync (iPhone pushes, this process receives) --------------------
+# The Readiness iOS app runs HKAnchoredObjectQuery and POSTs only the samples
+# added since its last successful sync. The receiver lives inside the MCP server
+# process (see sync_receiver.py), so receiving and importing share one process
+# and can never contend for DuckDB's single writer.
+#
+# Wire contract v1 (an iOS client is built against these exact strings):
+#   Bonjour service  _healthsync._tcp  in  local.
+#   TXT records      v=1, did=<device_id>, path=/v1
+#   Auth header      X-Health-Token: <base64url of 32 random bytes, unpadded>
+SYNC_PROTOCOL_VERSION = 1
+SYNC_SERVICE_TYPE = "_healthsync._tcp."      # zeroconf wants the trailing dot
+SYNC_SERVICE_DOMAIN = "local."
+SYNC_API_PREFIX = "/v1"
+SYNC_AUTH_HEADER = "X-Health-Token"
+
+# Spool: batches land here the moment they are received, BEFORE any import.
+# Deliberately a sibling of the export drop-folder — same place, same backups,
+# and a human can see the raw NDJSON if a sync is ever in doubt. Resolved at
+# call time (like calibration_reference_path) so a test that redirects
+# EXPORT_DIR gets the redirected spool too.
+SYNC_SPOOL_DIR_NAME = "deltas"
+SYNC_SPOOL_DIR = (Path(os.environ["HEALTH_SYNC_SPOOL_DIR"])
+                  if os.environ.get("HEALTH_SYNC_SPOOL_DIR") else None)
+
+
+def sync_spool_dir() -> Path:
+    """Absolute path of the delta spool folder, resolved now."""
+    return SYNC_SPOOL_DIR or (EXPORT_DIR / SYNC_SPOOL_DIR_NAME)
+
+
+# Pairing state (shared token + this Mac's stable device id). Written 0600 into
+# data/, which is git-ignored. Resolved at call time for the same reason.
+SYNC_PAIRING_NAME = "sync_pairing.json"
+SYNC_PAIRING_PATH = (Path(os.environ["HEALTH_SYNC_PAIRING"])
+                     if os.environ.get("HEALTH_SYNC_PAIRING") else None)
+
+
+def sync_pairing_path() -> Path:
+    """Absolute path of the pairing file (token + device id), resolved now."""
+    return SYNC_PAIRING_PATH or (STATE_DIR / SYNC_PAIRING_NAME)
+
+
+# Listener. Port 0 = ephemeral (the port travels in the Bonjour TXT record and
+# in the pairing payload, so nothing needs a fixed number). Bind on all
+# interfaces: the phone reaches the Mac over the LAN address, not loopback.
+SYNC_BIND_HOST = os.environ.get("HEALTH_SYNC_BIND", "0.0.0.0")
+SYNC_PORT = int(os.environ.get("HEALTH_SYNC_PORT", "0"))
+# Set HEALTH_SYNC_DISABLED=1 to start the MCP server with no listener at all.
+SYNC_DISABLED = os.environ.get("HEALTH_SYNC_DISABLED", "") not in ("", "0", "false", "no")
+
+# Body limits. A day of anchored deltas is tens of KB; 32 MB compressed is a
+# backfill of many months and still far below anything that could hurt. The
+# decompressed cap exists because gzip is trivially bomb-able.
+SYNC_MAX_BODY_BYTES = int(os.environ.get("HEALTH_SYNC_MAX_BODY", 32 * 1024 * 1024))
+SYNC_MAX_DECOMPRESSED_BYTES = int(
+    os.environ.get("HEALTH_SYNC_MAX_DECOMPRESSED", 512 * 1024 * 1024))

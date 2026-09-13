@@ -9,6 +9,8 @@ dependencies = [
     "duckdb>=1.0.0",
     "pyarrow>=15.0.0",  # fast columnar bulk-insert path (executemany is far too slow)
     "pytz>=2024.1",  # required by duckdb to materialize TIMESTAMPTZ into Python
+    "zeroconf>=0.131",  # Bonjour advert for the LAN delta receiver, so the phone needs no IP
+    "segno>=1.6",  # pure-python QR for pair_device (no pillow, no other deps)
 ]
 
 [project.scripts]
