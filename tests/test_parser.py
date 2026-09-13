@@ -142,6 +142,9 @@ def test_iter_export_counts(tmp_path):
     kinds = [k for k, _ in parser.iter_export(xml)]
     assert kinds.count("record") == 6
     assert kinds.count("workout") == 1
+    # That workout has <WorkoutStatistics> but no structure (no <WorkoutEvent>
+    # / <WorkoutActivity>), so it contributes no workout_event rows.
+    assert kinds.count("workout_event") == 0
     assert kinds.count("sleep") == 1          # sleep is emitted in addition to record
     assert kinds.count("activity_summary") == 1
 
