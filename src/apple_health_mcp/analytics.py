@@ -159,12 +159,19 @@ def zone_time(q: Query, where_sql: str, params: tuple, max_hr: float,
     Each sample is weighted by the gap to the next sample (`lead`), capped at
     `cap_seconds` so gaps between separate sessions don't inflate a zone. Returns
     an ordered Z1–Z5 list with seconds/minutes/share plus totals and bounds.
+
+    The last sample has no successor, so `lead` is NULL and it must weigh 0 —
+    hence the `coalesce` INSIDE `least`, which is load-bearing. `least` ignores
+    NULL arguments rather than propagating them, so the obvious
+    `least(date_diff(...), cap)` returns the *cap* for that row, crediting a
+    full `cap_seconds` to whichever zone the final sample fell in. Must stay
+    byte-identical to `zones.zone_time`, which the parity test pins.
     """
     sql = (
         "WITH hr AS ("
         "  SELECT value AS hr, "
-        "    least(date_diff('second', start_ts, "
-        "      lead(start_ts) OVER (ORDER BY start_ts)), ?) AS dt "
+        "    least(coalesce(date_diff('second', start_ts, "
+        "      lead(start_ts) OVER (ORDER BY start_ts)), 0), ?) AS dt "
         f"  FROM records_dedup WHERE {where_sql}"
         ") "
         f"SELECT {zone_case_sql(max_hr)} AS zone, "

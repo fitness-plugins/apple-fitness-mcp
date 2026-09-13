@@ -26,6 +26,46 @@ STATE_DIR = PROJECT_ROOT / "data"
 IMPORT_STATE_PATH = STATE_DIR / "import_state.json"
 LOG_DIR = PROJECT_ROOT / "logs"
 
+# Where the biweekly recalibration job persists its derived reference values
+# (scripts/recalibration_check.sh -> scripts/calibrate.py --check). Beside the
+# HRV baseline stats this is the file that carries the *calibrated* HR anchors
+# ("hr_max", "resting_hr"); zones.py prefers them over the raw observed maxima,
+# because the single highest reading in an export is a sensor artefact.
+#
+# Unlike the other paths this one is NOT bound to STATE_DIR at import time.
+# It is machine-local state written by a launchd job on a schedule, so a
+# sandboxed test that redirected STATE_DIR but not this constant would read the
+# developer's real file — and would then pass or fail depending on whether the
+# biweekly job had happened to fire. `calibration_reference_path()` resolves it
+# through STATE_DIR at call time instead, so redirecting STATE_DIR is enough.
+CALIBRATION_REFERENCE_NAME = "calibration_reference.json"
+# Explicit override; None means "derive from STATE_DIR". Set from the
+# CALIBRATION_REFERENCE env var — the same one the shell job reads — and
+# monkeypatchable directly by tests that want one specific file.
+CALIBRATION_REFERENCE_PATH = (
+    Path(os.environ["CALIBRATION_REFERENCE"])
+    if os.environ.get("CALIBRATION_REFERENCE") else None)
+
+
+def calibration_reference_path() -> Path:
+    """Absolute path of the recalibration reference file, resolved now.
+
+    Reads the module globals on every call, so both `CALIBRATION_REFERENCE_PATH`
+    and `STATE_DIR` work as monkeypatch points.
+    """
+    return CALIBRATION_REFERENCE_PATH or (STATE_DIR / CALIBRATION_REFERENCE_NAME)
+
+
+# Per-athlete absolute-bpm training zones (recovery / easy / grey / threshold /
+# vo2max) used by zones.py alongside the %-of-max Z1-Z5 model. This is personal
+# configuration, so it lives in a JSON file rather than in code; the shipped
+# default sits in config/ at the repo root (NOT in data/, which is git-ignored).
+# Overridable via HEALTH_ZONES_CONFIG (used by tests).
+ZONES_CONFIG_DIR = PROJECT_ROOT / "config"
+DEFAULT_ZONES_CONFIG_PATH = ZONES_CONFIG_DIR / "training_zones.json"
+ZONES_CONFIG_PATH = Path(os.environ.get(
+    "HEALTH_ZONES_CONFIG", DEFAULT_ZONES_CONFIG_PATH))
+
 # Deduplication: when the same metric is reported by multiple devices for
 # overlapping time windows, prefer higher-priority sources. Higher number wins.
 # Apple Watch generally has better sensors than the phone for HR/energy/etc.

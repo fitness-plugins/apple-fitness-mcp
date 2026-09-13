@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "note": "Per-athlete absolute-bpm training zones. Bands are inclusive on both edges and must be contiguous (each max_bpm + 1 == the next min_bpm); null means open-ended. 'grey' is the moderate-intensity rut the training model exists to eliminate, and it is deliberately kept separate from 'threshold' -- the %-of-max Z4 band lumps 166-186 together and cannot answer 'how much of that was actually threshold?'. Override the file location with HEALTH_ZONES_CONFIG.",
+  "zones": [
+    {
+      "name": "recovery",
+      "min_bpm": null,
+      "max_bpm": 149,
+      "description": "Genuinely easy. Recovery jogs and warmup finish should land here."
+    },
+    {
+      "name": "easy",
+      "min_bpm": 150,
+      "max_bpm": 165,
+      "description": "Aerobic base. Benchmark 5 km is held at 163-167."
+    },
+    {
+      "name": "grey",
+      "min_bpm": 166,
+      "max_bpm": 177,
+      "description": "The moderate-intensity rut: too hard to recover from, too easy to drive adaptation. Time here is the number to drive down."
+    },
+    {
+      "name": "threshold",
+      "min_bpm": 178,
+      "max_bpm": 186,
+      "description": "Steady-state threshold work. HR should flatten here, not ramp."
+    },
+    {
+      "name": "vo2max",
+      "min_bpm": 187,
+      "max_bpm": null,
+      "description": "VO2max intervals. Reps drifting up here are overcooked threshold reps."
+    }
+  ]
+}

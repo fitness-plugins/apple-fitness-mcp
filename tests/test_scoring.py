@@ -347,6 +347,14 @@ def _install(tmp_path, monkeypatch, xml: str):
     monkeypatch.setattr(config, "STATE_DIR", tmp_path)
     monkeypatch.setattr(config, "IMPORT_STATE_PATH", tmp_path / "import_state.json")
     monkeypatch.setattr(config, "LOG_DIR", tmp_path / "logs")
+    # get_readiness / get_recovery resolve their HR anchors through `zones`,
+    # which reads the recalibration reference first. Redirecting STATE_DIR above
+    # already sandboxes it (config.calibration_reference_path() derives from
+    # STATE_DIR), but pin it explicitly so a stray CALIBRATION_REFERENCE in the
+    # developer's environment cannot make these tests depend on whether the
+    # biweekly launchd job has fired.
+    monkeypatch.setattr(config, "CALIBRATION_REFERENCE_PATH",
+                        tmp_path / "no_calibration.json")
     archive = exp / "export.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("apple_health_export/export.xml", xml)

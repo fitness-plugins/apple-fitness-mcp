@@ -16,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from . import (analytics, config, import_pipeline, scoring, storage,
-               sync_import, sync_pairing, sync_receiver, sync_spool)
+               sync_import, sync_pairing, sync_receiver, sync_spool, zones)
 
 mcp = FastMCP("apple-health")
 
@@ -273,58 +273,357 @@ def get_workouts(start_date: Optional[str] = None, end_date: Optional[str] = Non
 
 # --- intraday training analytics ------------------------------------------------
 
+# Sections `get_workout_detail` can emit. `include=None` means all of them, so a
+# caller that passes nothing gets exactly the response it got before.
+_DETAIL_SECTIONS = ("series", "zones", "splits", "decoupling", "reps")
+
+# Structured-interval steps live in `workout_events`. Filtering is on
+# `workout_start_ts`, NOT `workout_hash`: the export stores one session 2-3
+# times under different row_hashes (repeated exports, watch renames), so the
+# copy the `DISTINCT ON (type, start minute)` dedup picks for `workouts` is not
+# necessarily the copy the events hang off. The flip side is that those copies
+# duplicate the events too, so steps are de-duplicated here on Apple's own
+# per-activity uuid plus document order. Only `event_kind = 'activity'` rows are
+# repetitions; the top-level `event` rows (segment/pause/resume/marker) have
+# arbitrarily overlapping durations and are not usable as reps.
+# Written in the shape `dashboard._q_workouts` / `zones.per_run_maxima` use and
+# that the DuckDB build the server ships is known to run: the DISTINCT ON
+# expressions are selected explicitly, the subquery is left unaliased, and
+# nothing is aliased at all (`hours` taught us not to trust alias names here).
+_REP_COLS = (
+    "step_index, step_key_path, step_block, step_repeat, step_slot, "
+    "step_successful, start_ts, end_ts, duration, duration_unit, "
+    "distance, distance_unit, avg_hr, min_hr, max_hr, avg_speed, speed_unit"
+)
+_REP_SQL = (
+    f"SELECT {_REP_COLS} FROM ("
+    "  SELECT DISTINCT ON (activity_uuid, step_index) "
+    "         activity_uuid, workout_source_name, " + _REP_COLS +
+    "  FROM workout_events "
+    "  WHERE event_kind = 'activity' "
+    "    AND workout_start_ts = CAST(? AS TIMESTAMPTZ) "
+    "  ORDER BY activity_uuid, step_index, workout_source_name"
+    ") ORDER BY step_index"
+)
+
+# Apple writes durationUnit/unit alongside every quantity; normalise rather than
+# assume, so a step measured in seconds or metres still yields a real min/km.
+_STEP_DURATION_TO_MIN = {
+    "min": 1.0, "mins": 1.0, "minute": 1.0, "minutes": 1.0,
+    "s": 1.0 / 60.0, "sec": 1.0 / 60.0, "secs": 1.0 / 60.0,
+    "second": 1.0 / 60.0, "seconds": 1.0 / 60.0,
+    "h": 60.0, "hr": 60.0, "hour": 60.0, "hours": 60.0,
+}
+_STEP_DISTANCE_TO_KM = {
+    "km": 1.0, "m": 0.001, "mi": 1.609344, "ft": 0.0003048, "yd": 0.0009144,
+}
+
+
+def _as_bpm(value: float) -> int:
+    """Whole bpm for a resolved HR anchor.
+
+    `zones` returns a float; the tools have always surfaced `max_hr_used` /
+    `resting_hr_used` as an int, and every downstream boundary is a whole bpm,
+    so the JSON shape is preserved by rounding once, here.
+    """
+    return int(round(value))
+
+
+def _hr_max_anchor(max_hr: Optional[float] = None) -> tuple[int, str]:
+    """(bpm, source) for HRmax — the single resolution path for every tool.
+
+    Routed through `zones.resolve_hr_max` so the observed 210 bpm artefact does
+    not silently define every zone boundary; the calibrated / functional value
+    (p95 of the deduplicated per-run maxima) wins when one is available.
+    """
+    value, source = zones.resolve_hr_max(_q, max_hr)
+    return _as_bpm(value), source
+
+
+def _resting_hr_anchor(resting_hr: Optional[float] = None) -> tuple[int, str]:
+    """(bpm, source) for resting HR, via `zones.resolve_resting_hr`."""
+    value, source = zones.resolve_resting_hr(_q, resting_hr)
+    return _as_bpm(value), source
+
+
+def _training_bounds() -> tuple[Optional[list[dict]], Optional[str]]:
+    """(bounds, error). A malformed personal zone file must not 500 a tool."""
+    try:
+        return zones.training_zone_bounds(), None
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def _include_sections(include: Any) -> tuple[set, Optional[str]]:
+    """(wanted sections, error). None/empty means every section (the default)."""
+    if include is None:
+        return set(_DETAIL_SECTIONS), None
+    if isinstance(include, str):
+        raw = [p for p in re.split(r"[,\s]+", include) if p]
+    else:
+        raw = [str(p).strip() for p in include if str(p).strip()]
+    if not raw:
+        return set(_DETAIL_SECTIONS), None
+    wanted, unknown = set(), []
+    for name in raw:
+        low = name.lower()
+        if low == "all":
+            wanted.update(_DETAIL_SECTIONS)
+        elif low in _DETAIL_SECTIONS:
+            wanted.add(low)
+        else:
+            unknown.append(name)
+    if unknown:
+        return set(), (f"Unknown include section(s): {', '.join(unknown)}. "
+                       f"Valid sections: {', '.join(_DETAIL_SECTIONS)}.")
+    return wanted, None
+
+
+def _step_minutes(duration, unit, start, end) -> Optional[float]:
+    """A step's length in minutes, from its own quantity or its timestamps."""
+    if duration is not None:
+        factor = _STEP_DURATION_TO_MIN.get((unit or "min").strip().lower())
+        if factor is not None:
+            return float(duration) * factor
+    if start is not None and end is not None:
+        return (end - start).total_seconds() / 60.0
+    return None
+
+
+def _step_km(distance, unit) -> Optional[float]:
+    """A step's distance in km, or None when the unit is not one we know."""
+    if distance is None:
+        return None
+    factor = _STEP_DISTANCE_TO_KM.get((unit or "km").strip().lower())
+    return float(distance) * factor if factor is not None else None
+
+
+def _rep_role(block, slot, block_sizes: dict, blocks: list) -> str:
+    """warmup / work / recovery / cooldown for one structured step.
+
+    `step_key_path` is Apple's `block.repetition.step`: within a repeat block
+    slot 0 is the work interval and slot 1 the recovery. Warm-up is the first
+    block and cool-down the last — but only for blocks holding a *single* step,
+    because a repeat block is also first or last whenever the session has no
+    separate warm-up or cool-down, and its slots must still win.
+    """
+    by_slot = "work" if slot == 0 else ("recovery" if slot == 1 else "step")
+    if block is None or block not in block_sizes:
+        return by_slot
+    if block_sizes[block] > 1 or len(blocks) < 2:
+        return by_slot
+    if block == blocks[0]:
+        return "warmup"
+    if block == blocks[-1]:
+        return "cooldown"
+    return by_slot
+
+
+def _no_reps() -> dict:
+    """The explicit empty marker for a workout with no structured intervals."""
+    return {
+        "structured": False,
+        "interval_structure": False,
+        "count": 0,
+        "roles": {},
+        "work_summary": None,
+        "steps": [],
+        "note": "This workout has no structured-interval data (no "
+                "WorkoutActivity rows in workout_events); it was not built in "
+                "the Workout app's interval builder. This is the normal case.",
+    }
+
+
+def _build_reps(rows: list[dict], bounds: Optional[list[dict]]) -> dict:
+    """Decode `workout_events` activity rows into labelled repetitions.
+
+    Pure: takes rows and zone bounds, touches no database. Pace is derived from
+    the step's own distance and duration (min/km), not from avg_speed, so a step
+    without a speed statistic still reports one.
+    """
+    if not rows:
+        return _no_reps()
+    blocks = sorted({r["step_block"] for r in rows if r["step_block"] is not None})
+    block_sizes: dict = {}
+    for r in rows:
+        b = r["step_block"]
+        if b is not None:
+            block_sizes[b] = block_sizes.get(b, 0) + 1
+
+    steps: list[dict] = []
+    roles: dict = {}
+    for r in rows:
+        role = _rep_role(r["step_block"], r["step_slot"], block_sizes, blocks)
+        roles[role] = roles.get(role, 0) + 1
+        minutes = _step_minutes(r["duration"], r["duration_unit"],
+                                r["start_ts"], r["end_ts"])
+        km = _step_km(r["distance"], r["distance_unit"])
+        pace = None
+        if minutes and km and km > 0 and minutes > 0:
+            pace = round(minutes / km, 2)
+        steps.append({
+            "step_index": r["step_index"],
+            "role": role,
+            "key_path": r["step_key_path"],
+            "block": r["step_block"],
+            "repeat": r["step_repeat"],
+            "slot": r["step_slot"],
+            "successful": r["step_successful"],
+            "start_ts": r["start_ts"],
+            "end_ts": r["end_ts"],
+            "duration_min": round(minutes, 2) if minutes is not None else None,
+            "distance_km": round(km, 3) if km is not None else None,
+            "pace_min_per_km": pace,
+            "avg_hr": round(r["avg_hr"], 0) if r["avg_hr"] else None,
+            "min_hr": round(r["min_hr"], 0) if r["min_hr"] else None,
+            "max_hr": round(r["max_hr"], 0) if r["max_hr"] else None,
+            "avg_speed_kmh": round(r["avg_speed"], 2) if r["avg_speed"] else None,
+            "training_zone": (zones.classify(r["avg_hr"], bounds)
+                              if bounds else None),
+        })
+
+    work = [s for s in steps if s["role"] == "work"]
+    # An interval session = repeated work efforts, or work separated by an
+    # explicit recovery step. That is the condition under which first-half vs
+    # second-half decoupling stops meaning anything.
+    interval = len(work) >= 2 or roles.get("recovery", 0) >= 1
+    return {
+        "structured": True,
+        "interval_structure": interval,
+        "count": len(steps),
+        "roles": roles,
+        "work_summary": _work_summary(work),
+        "steps": steps,
+        "note": "step_key_path is Apple's block.repetition.step. Within a "
+                "repeat block slot 0 is the work interval and slot 1 the "
+                "recovery; the first/last single-step blocks are the warm-up "
+                "and cool-down. Read 'role' to tell reps from recoveries.",
+    }
+
+
+def _work_summary(work: list[dict]) -> Optional[dict]:
+    """Aggregate over the work reps only, so the session reads at a glance."""
+    if not work:
+        return None
+    paces = [s["pace_min_per_km"] for s in work if s["pace_min_per_km"]]
+    hrs = [s["avg_hr"] for s in work if s["avg_hr"]]
+    peaks = [s["max_hr"] for s in work if s["max_hr"]]
+    dists = [s["distance_km"] for s in work if s["distance_km"]]
+    by_zone: dict = {}
+    for s in work:
+        z = s["training_zone"]
+        if z:
+            by_zone[z] = by_zone.get(z, 0) + 1
+    return {
+        "count": len(work),
+        "distance_km": round(sum(dists), 3) if dists else None,
+        "avg_pace_min_per_km": round(sum(paces) / len(paces), 2) if paces else None,
+        "fastest_pace_min_per_km": min(paces) if paces else None,
+        "slowest_pace_min_per_km": max(paces) if paces else None,
+        "avg_hr": round(sum(hrs) / len(hrs), 0) if hrs else None,
+        "max_hr": max(peaks) if peaks else None,
+        "training_zone_counts": by_zone,
+    }
+
 
 @mcp.tool(annotations=RO,
           description="Full intraday breakdown of one workout: binned HR / power "
-                      "/ speed (pace) / cadence series, time in HR zones, aerobic "
-                      "decoupling (cardiac drift), and per-km splits. Picks the "
-                      "workout by workout_id (row_hash), or the most recent one "
-                      "matching optional type/date filters. max_hr defaults to the "
-                      "athlete's observed max across all workouts. HR zones: "
-                      "Z1 <60%, Z2 60-70%, Z3 70-80%, Z4 80-90%, Z5 >=90% of "
-                      "max_hr. Metrics absent from a given workout (e.g. power on "
-                      "a walk) degrade to null.")
+                      "/ speed (pace) / cadence series, time in HR zones under "
+                      "both zone models, aerobic decoupling (cardiac drift), "
+                      "per-km splits, and the individual repetitions of a "
+                      "structured interval session. Picks the workout by "
+                      "workout_id (row_hash), or the most recent one matching "
+                      "optional type/date filters. max_hr defaults to the "
+                      "calibrated / functional HRmax (p95 of per-run maxima), "
+                      "not the single highest observed reading. Two zone models "
+                      "are returned side by side: 'hr_zones' is the %-of-max "
+                      "scheme (Z1 <60%, Z2 60-70%, Z3 70-80%, Z4 80-90%, "
+                      "Z5 >=90% of max_hr) and 'training_zones' the athlete's "
+                      "named absolute bands (recovery <=149, easy 150-165, grey "
+                      "166-177, threshold 178-186, vo2max 187+) — use the latter "
+                      "to tell real threshold work from grey-zone time, which "
+                      "Z4 lumps together. 'reps' lists each interval step in "
+                      "order with role (warmup/work/recovery/cooldown), "
+                      "duration, distance, pace in min/km, avg/min/max HR and "
+                      "its training zone; it reports structured=false for an "
+                      "ordinary run, and for an interval session decoupling is "
+                      "marked not applicable (the HR:power ratio is meant to "
+                      "move between reps). Pass include=['zones'] — any of "
+                      "series, zones, splits, decoupling, reps — to trim the "
+                      "payload; the series alone is ~200 points for a "
+                      "100-minute run at bin_seconds=30. Metrics absent from a "
+                      "workout (e.g. power on a walk) degrade to null.")
 def get_workout_detail(workout_id: Optional[str] = None,
                        type: Optional[str] = None, date: Optional[str] = None,
                        bin_seconds: int = 30,
-                       max_hr: Optional[int] = None) -> dict:
+                       max_hr: Optional[int] = None,
+                       include: Optional[list[str]] = None) -> dict:
     _ensure_ready()
+    want, bad_include = _include_sections(include)
+    if bad_include:
+        return {"error": bad_include}
     w = analytics.select_workout(_q, workout_id=workout_id, type=type, date=date)
     if not w:
         return {"error": "No matching workout found.",
                 "note": "Adjust workout_id/type/date, or import data first."}
-    hr_max, hr_src = analytics.resolve_max_hr(_q, max_hr)
+    hr_max, hr_src = _hr_max_anchor(max_hr)
     start, end = w["start_ts"], w["end_ts"]
+    # The named bands are read once and shared by the zone totals and the reps.
+    tz_bounds, tz_err = _training_bounds()
 
     # 2. binned series with derived pace + cadence.
-    points = analytics.binned_series(_q, start, end, bin_seconds,
-                                     analytics.SERIES_METRICS)
-    for p in points:
-        p["pace_min_per_km"] = analytics.pace_min_per_km(p.get("speed"))
-        p["cadence_spm"] = analytics.cadence_spm(p.get("speed"), p.get("stride"))
-        for k in ("hr", "power", "speed", "stride"):
-            if p.get(k) is not None:
-                p[k] = round(p[k], 1)
+    series = None
+    if "series" in want:
+        points = analytics.binned_series(_q, start, end, bin_seconds,
+                                         analytics.SERIES_METRICS)
+        for p in points:
+            p["pace_min_per_km"] = analytics.pace_min_per_km(p.get("speed"))
+            p["cadence_spm"] = analytics.cadence_spm(p.get("speed"),
+                                                     p.get("stride"))
+            for k in ("hr", "power", "speed", "stride"):
+                if p.get(k) is not None:
+                    p[k] = round(p[k], 1)
+        series = {"bin_seconds": bin_seconds, "count": len(points),
+                  "points": points}
 
-    # 3. HR zones over the window.
-    zones = analytics.zone_time(
-        _q, "type = 'heart_rate' AND start_ts >= ? AND start_ts <= ?",
-        (start, end), hr_max)
+    # 3. HR zones over the window, under both models.
+    hr_zones = training_zones = None
+    if "zones" in want:
+        where_sql = "type = 'heart_rate' AND start_ts >= ? AND start_ts <= ?"
+        params = (start, end)
+        hr_zones = zones.zone_time(_q, where_sql, params,
+                                   zones.percent_zone_bounds(hr_max))
+        training_zones = (
+            zones.zone_time(_q, where_sql, params, tz_bounds,
+                            model=zones.TRAINING_MODEL)
+            if tz_bounds else {"model": zones.TRAINING_MODEL, "error": tz_err})
 
-    # 4. decoupling: split the window in half, HR-to-power (or HR-to-speed) drift.
-    mid = start + (end - start) / 2
-    halves = _q(
-        "SELECT CASE WHEN start_ts < ? THEN 1 ELSE 2 END AS half, "
-        "avg(value) FILTER (WHERE type = 'heart_rate') AS hr, "
-        "avg(value) FILTER (WHERE type = 'running_power') AS power, "
-        "avg(value) FILTER (WHERE type = 'running_speed') AS speed "
-        "FROM records_dedup WHERE start_ts >= ? AND start_ts <= ? "
-        "GROUP BY half ORDER BY half",
-        (mid, start, end))
-    decoupling = _decoupling_from_halves(halves)
+    # 4. repetitions. Read whenever decoupling is wanted too: whether the
+    # session has interval structure decides whether decoupling means anything.
+    reps = None
+    if "reps" in want or "decoupling" in want:
+        reps = _build_reps(_q(_REP_SQL, (start,)), tz_bounds)
 
-    # 5. per-km splits from cumulative running distance.
-    splits = _km_splits(start, end)
+    # 5. decoupling: split the window in half, HR-to-power (or HR-to-speed)
+    # drift — but only where that is a statement about aerobic control.
+    decoup = None
+    if "decoupling" in want:
+        if reps and reps["interval_structure"]:
+            decoup = _decoupling_not_applicable(reps)
+        else:
+            mid = start + (end - start) / 2
+            halves = _q(
+                "SELECT CASE WHEN start_ts < ? THEN 1 ELSE 2 END AS half, "
+                "avg(value) FILTER (WHERE type = 'heart_rate') AS hr, "
+                "avg(value) FILTER (WHERE type = 'running_power') AS power, "
+                "avg(value) FILTER (WHERE type = 'running_speed') AS speed "
+                "FROM records_dedup WHERE start_ts >= ? AND start_ts <= ? "
+                "GROUP BY half ORDER BY half",
+                (mid, start, end))
+            decoup = _decoupling_from_halves(halves)
+
+    # 6. per-km splits from cumulative running distance.
+    splits = _km_splits(start, end) if "splits" in want else None
 
     summary = {
         "workout_id": w["row_hash"],
@@ -338,15 +637,54 @@ def get_workout_detail(workout_id: Optional[str] = None,
         "source_name": w["source_name"],
         "max_hr_used": hr_max, "max_hr_source": hr_src,
     }
+    note = (f"max_hr {hr_max} bpm ({hr_src}). Missing metrics are null "
+            "(e.g. no power/cadence when the device didn't record them).")
+    if want != set(_DETAIL_SECTIONS):
+        note += (" Sections limited by include=" +
+                 f"{sorted(want)}; omitted sections are absent, not empty.")
+
+    # Assembled in the historical key order, with the new sections appended.
+    out: dict[str, Any] = {"summary": summary}
+    if series is not None:
+        out["series"] = series
+    if hr_zones is not None:
+        out["hr_zones"] = hr_zones
+        out["training_zones"] = training_zones
+    if decoup is not None:
+        out["decoupling"] = decoup
+    if splits is not None:
+        out["splits"] = splits
+    if "reps" in want:
+        out["reps"] = reps
+    out["note"] = note
+    return out
+
+
+def _decoupling_not_applicable(reps: dict) -> dict:
+    """Decoupling suppressed for an interval session, with the reason why.
+
+    Five hard reps with walking recoveries move the HR:power ratio by design, so
+    a first-half/second-half drift number describes the session's structure and
+    reads as a finding ("13.2%, poor aerobic control") when it is an artefact.
+    Same key set as `_decoupling_from_halves` so callers need no special case;
+    `good_aerobic_control` is None (unknown), never False.
+    """
+    n_work = reps["roles"].get("work", 0)
+    n_rec = reps["roles"].get("recovery", 0)
     return {
-        "summary": summary,
-        "series": {"bin_seconds": bin_seconds, "count": len(points),
-                   "points": points},
-        "hr_zones": zones,
-        "decoupling": decoupling,
-        "splits": splits,
-        "note": f"max_hr {hr_max} bpm ({hr_src}). Missing metrics are null "
-                "(e.g. no power/cadence when the device didn't record them).",
+        "drift_pct": None,
+        "applicable": False,
+        "basis": None,
+        "first_half_ratio": None,
+        "second_half_ratio": None,
+        "good_aerobic_control": None,
+        "reason": (f"Interval session ({n_work} work rep{'' if n_work == 1 else 's'}"
+                   f", {n_rec} recover{'y' if n_rec == 1 else 'ies'}): "
+                   "the HR:power ratio is supposed to move between hard reps and "
+                   "recoveries, so half-vs-half drift measures the session "
+                   "design, not aerobic control. Compare the per-rep HR and pace "
+                   "in 'reps' instead. Decoupling is meaningful on a steady "
+                   "continuous effort."),
     }
 
 
@@ -356,6 +694,7 @@ def _decoupling_from_halves(halves: list[dict]) -> dict:
     h1, h2 = by_half.get(1), by_half.get(2)
     if not h1 or not h2:
         return {"drift_pct": None,
+                "applicable": True,
                 "note": "Not enough data in both halves to compute drift."}
     # Prefer HR:power (efficiency); fall back to HR:speed when power is absent.
     if h1.get("power") and h2.get("power"):
@@ -369,6 +708,7 @@ def _decoupling_from_halves(halves: list[dict]) -> dict:
     drift = analytics.decoupling(r1, r2)
     return {
         "drift_pct": drift,
+        "applicable": True,
         "basis": basis,
         "first_half_ratio": round(r1, 4) if r1 else None,
         "second_half_ratio": round(r2, 4) if r2 else None,
@@ -422,18 +762,26 @@ def _km_splits(start, end) -> list[dict]:
 
 
 @mcp.tool(annotations=RO,
-          description="Time spent in heart-rate zones Z1-Z5 aggregated over a "
-                      "period (not a single workout). scope='workouts' counts "
-                      "only HR recorded inside logged workout windows; "
-                      "scope='all' counts every heart_rate sample in range. "
-                      "max_hr defaults to the observed workout max. HR zones: "
-                      "Z1 <60%, Z2 60-70%, Z3 70-80%, Z4 80-90%, Z5 >=90% of "
-                      "max_hr (Z1 has no lower gap, so scope='all' totals include "
-                      "rest/sleep HR).")
+          description="Time spent in heart-rate zones aggregated over a period "
+                      "(not a single workout), under both zone models at once. "
+                      "scope='workouts' counts only HR recorded inside logged "
+                      "workout windows; scope='all' counts every heart_rate "
+                      "sample in range. max_hr defaults to the calibrated / "
+                      "functional HRmax (p95 of per-run maxima), not the single "
+                      "highest observed reading. The top-level 'zones' is the "
+                      "%-of-max model (Z1 <60%, Z2 60-70%, Z3 70-80%, "
+                      "Z4 80-90%, Z5 >=90% of max_hr; Z1 has no lower gap, so "
+                      "scope='all' totals include rest/sleep HR). "
+                      "'training_zones' is the athlete's named absolute-bpm "
+                      "model (recovery <=149, easy 150-165, grey 166-177, "
+                      "threshold 178-186, vo2max 187+); read its "
+                      "minutes_by_zone to answer how many minutes were actually "
+                      "at threshold rather than in the grey zone — a split the "
+                      "percentage model cannot make, because Z4 spans both.")
 def get_hr_zones(start_date: Optional[str] = None, end_date: Optional[str] = None,
                  max_hr: Optional[int] = None, scope: str = "workouts") -> dict:
     _ensure_ready()
-    hr_max, hr_src = analytics.resolve_max_hr(_q, max_hr)
+    hr_max, hr_src = _hr_max_anchor(max_hr)
     clauses = ["type = 'heart_rate'"]
     params: list = []
     rng = _date_filter("start_ts", start_date, end_date, params)
@@ -444,13 +792,28 @@ def get_hr_zones(start_date: Optional[str] = None, end_date: Optional[str] = Non
             "EXISTS (SELECT 1 FROM workouts w "
             "WHERE records_dedup.start_ts BETWEEN w.start_ts AND w.end_ts)")
     where_sql = " AND ".join(clauses)
-    zones = analytics.zone_time(_q, where_sql, tuple(params), hr_max)
+    where_params = tuple(params)
+
+    percent = zones.zone_time(_q, where_sql, where_params,
+                              zones.percent_zone_bounds(hr_max))
+    bounds, zone_err = _training_bounds()
+    if bounds:
+        training = zones.zone_time(_q, where_sql, where_params, bounds,
+                                   model=zones.TRAINING_MODEL)
+        named = ", ".join(f"{k} {v} min"
+                          for k, v in training["minutes_by_zone"].items())
+        named_note = f" Named bands: {named}."
+    else:
+        training = {"model": zones.TRAINING_MODEL, "error": zone_err}
+        named_note = f" Named bands unavailable: {zone_err}"
     return {
         "scope": scope,
         "max_hr_used": hr_max, "max_hr_source": hr_src,
-        **zones,
+        **percent,
+        "training_zones": training,
         "note": f"max_hr {hr_max} bpm ({hr_src}). Time weighted by gaps between "
-                "samples, capped at 60s. scope='all' includes non-workout HR.",
+                "samples, capped at 60s. scope='all' includes non-workout HR."
+                + named_note,
     }
 
 
@@ -460,14 +823,17 @@ def get_hr_zones(start_date: Optional[str] = None, end_date: Optional[str] = Non
                       "workout's HR reserve where avg_hr exists, otherwise an "
                       "active-energy proxy so unlogged effort still counts. ACWR "
                       "= 7-day acute load vs 28-day chronic; 0.8-1.3 is the "
-                      "sweet spot, >1.5 flags elevated injury risk. max_hr / "
-                      "resting_hr default to observed values.")
+                      "sweet spot, >1.5 flags elevated injury risk. max_hr "
+                      "defaults to the calibrated / functional HRmax and "
+                      "resting_hr to a low percentile (p10) of recent "
+                      "resting_heart_rate; both report the source they "
+                      "resolved from.")
 def get_training_load(start_date: Optional[str] = None,
                       end_date: Optional[str] = None, max_hr: Optional[int] = None,
                       resting_hr: Optional[int] = None) -> dict:
     _ensure_ready()
-    hr_max, hr_src = analytics.resolve_max_hr(_q, max_hr)
-    rest, rest_src = analytics.resolve_resting_hr(_q, resting_hr)
+    hr_max, hr_src = _hr_max_anchor(max_hr)
+    rest, rest_src = _resting_hr_anchor(resting_hr)
 
     # Seed the ACWR rolling windows with the 28 days BEFORE start_date so the
     # 7-/28-day averages for the first displayed day reflect real prior load
@@ -1089,8 +1455,8 @@ def _recovery_time_hours(target: str, hr_max: float, rest: float) -> float:
 def _acwr_for_date(target: str) -> Optional[dict]:
     """The ACWR entry (ratio + acute load + flag) for `target`, seeded with the
     prior 28 days so acute/chronic reflect real history."""
-    hr_max, _ = analytics.resolve_max_hr(_q, None)
-    rest, _ = analytics.resolve_resting_hr(_q, None)
+    hr_max, _ = _hr_max_anchor()
+    rest, _ = _resting_hr_anchor()
     calc_start = (_to_dt(target).date() - timedelta(days=28)).isoformat()
     daily_ext = _training_daily(calc_start, target, hr_max, rest)
     if not daily_ext:
@@ -1131,8 +1497,8 @@ def get_readiness(date: Optional[str] = None) -> dict:
     acwr_entry = _acwr_for_date(target)
     acwr_val = acwr_entry["acwr"] if acwr_entry else None
     acute_load = acwr_entry["acute_7d"] if acwr_entry else None
-    hr_max, _ = analytics.resolve_max_hr(_q, None)
-    rest, _ = analytics.resolve_resting_hr(_q, None)
+    hr_max, _ = _hr_max_anchor()
+    rest, _ = _resting_hr_anchor()
     rec_time = _recovery_time_hours(target, hr_max, rest)
 
     # Directional z-scores for the Phase 1.3 illness detector (temp/resp/
@@ -1196,8 +1562,17 @@ def _validate_select(query: str) -> Optional[str]:
 @mcp.tool(annotations=RO,
           description="Run a read-only SELECT query against the health database "
                       "for anything the dedicated tools don't cover. "
-                      "Tables: records, records_dedup, workouts, sleep, "
-                      "activity_summary, clinical. DDL/DML is rejected.")
+                      "Tables: records, records_dedup, workouts, "
+                      "workout_events, sleep, activity_summary, clinical. "
+                      "workout_events holds the structural children of a "
+                      "workout: event_kind='activity' rows are the "
+                      "repetitions of a structured interval session (join "
+                      "them on workout_start_ts, not workout_hash, and note "
+                      "step_key_path = block.repetition.step, where slot 0 "
+                      "is the work interval and slot 1 the recovery); "
+                      "event_kind='event' rows are segment/pause/resume/"
+                      "marker boundaries whose durations overlap and are "
+                      "NOT usable as repetitions. DDL/DML is rejected.")
 def run_sql(query: str) -> dict:
     _ensure_ready()
     err = _validate_select(query)
