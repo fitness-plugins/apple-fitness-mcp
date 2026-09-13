@@ -6,6 +6,7 @@ client over stdio.
 """
 from __future__ import annotations
 
+import math
 import re
 from datetime import timedelta
 from typing import Any, Optional
@@ -620,16 +621,17 @@ SLEEPING_HR_FALLBACK_PCT = 0.05      # p5 when only generic 'asleep' staging exi
 _NIGHT_EXPR = "(start_ts + INTERVAL 6 HOUR)::DATE"
 # Sleep stages that count as the actual asleep window (in_bed brackets it).
 _ASLEEP_STAGES = ("asleep", "core", "deep", "rem")
-# Trailing baseline window per metric, excluding the target day. Calibration knob.
-BASELINE_WINDOW_DAYS = 28
-# Minimum days of history before a baseline is trustworthy (WHOOP-style cold
-# start). Below this the tools still compute but report state='calibrating'.
-MIN_HISTORY_DAYS = 14
-# Minimum baseline samples for a metric's z-score to be trusted. A metric scored
-# on fewer than this is still returned, but flagged low_confidence so the caller
-# knows the baseline is thin/noisy (Apple writes HRV etc. sparsely). Finer-grained
-# than the state field, which it does not affect.
-MIN_BASELINE_N = 10
+# Baseline windowing / confidence thresholds. The canonical values live on
+# scoring.ScoringConfig (single source of truth, mirrored in Swift); these names
+# are kept as aliases so the orchestration reads the same knobs the math does.
+#   BASELINE_WINDOW_DAYS — trailing baseline window per metric, excluding today.
+#   MIN_HISTORY_DAYS     — days of history before state leaves 'calibrating'.
+#   MIN_BASELINE_N       — baseline samples before a z is trusted; below it a
+#                          scored metric is flagged low_confidence (finer-grained
+#                          than the state field, which it does not affect).
+BASELINE_WINDOW_DAYS = scoring.DEFAULT_CONFIG.baseline_window_days
+MIN_HISTORY_DAYS = scoring.DEFAULT_CONFIG.min_history_days
+MIN_BASELINE_N = scoring.DEFAULT_CONFIG.min_baseline_n
 # Bedtime-regularity lookback (nights) and recovery-time heuristic constants.
 REGULARITY_WINDOW_NIGHTS = 14
 RECOVERY_TIME_PER_TRIMP_H = 0.25   # recovery hours a hard session "owes"
@@ -877,6 +879,9 @@ def _compute_recovery(date: Optional[str] = None) -> dict:
     subscores: dict[str, Optional[float]] = {}
     metrics: dict[str, dict] = {}
     low_confidence_metrics: list[str] = []
+    confidences: dict[str, float] = {}
+    hrv_base_for_cv: list[float] = []
+    hrv_recent_for_cv: list[float] = []
     # sleeping_hr reuses rhr_score's sign convention (higher HR than baseline
     # is worse); the metric name and extraction differ, the math does not.
     score_fns = {"hrv": scoring.hrv_score, "sleeping_hr": scoring.rhr_score,
@@ -886,10 +891,29 @@ def _compute_recovery(date: Optional[str] = None) -> dict:
         target_row = next((r for r in series if str(r["night"]) == target), None)
         today = target_row["value"] if target_row else None
         base_vals = _trailing_values(series, target)
-        mean, sd = scoring.baseline(base_vals)
-        z = scoring.zscore(today, mean, sd)
+        cfg = scoring.DEFAULT_CONFIG
+        # HRV is z-scored in log space over a robust/EWMA baseline (Phase 1.1/2),
+        # against a 7-day rolling average of the (log) input (Phase 2.1). We still
+        # report the raw-space baseline mean/sd for HRV (intuitive ms for the UI)
+        # but score off the log-space z and its log-space scale. Everything else
+        # uses the robust/EWMA baseline on the raw scale.
+        if name == "hrv":
+            mean, sd = scoring.baseline(base_vals)          # raw display
+            recent = _trailing_values(series, target,
+                                      window_days=cfg.hrv_smoothing_days - 1)
+            if today is not None:
+                recent = recent + [today]
+            _, sig_scale, z = scoring.hrv_baseline_z(today, base_vals,
+                                                     recent_values=recent)
+            hrv_base_for_cv, hrv_recent_for_cv = base_vals, recent
+        else:
+            mean, sd, _ = scoring.baseline_stats(base_vals)
+            sig_scale = sd
+            z = scoring.zscore(today, mean, sd)
         sub = score_fns[name](z)
+        swc, meaningful, significant = scoring.significance(z, sig_scale)
         subscores[name] = sub
+        confidences[name] = scoring.metric_confidence(len(base_vals))
         # Only a scored metric with a thin baseline is "low confidence"; a metric
         # with no value at all is simply absent (omitted from the weighted mean).
         low_conf = sub is not None and len(base_vals) < MIN_BASELINE_N
@@ -905,6 +929,9 @@ def _compute_recovery(date: Optional[str] = None) -> dict:
             "z": round(z, 2) if z is not None else None,
             "subscore": sub,
             "low_confidence": low_conf,
+            "swc": round(swc, 3) if swc is not None else None,
+            "meaningful_change": meaningful,
+            "significant_change": significant,
         }
         # Sleeping HR carries its actual per-night source + how much asleep data
         # the night had, so a thin/gated night is visible to the caller.
@@ -926,11 +953,16 @@ def _compute_recovery(date: Optional[str] = None) -> dict:
         deep_rem_frac = (deep_rem / hours) if (hours and deep_rem is not None) \
             else None
         regularity = _bedtime_regularity(sleep_rows, target)
+        # Personalize nightly need to the user's own baseline median (Phase 3.3).
+        base_hours = _trailing_values(sleep_rows, target, value_key="hours_asleep")
+        need_h = scoring.personalized_sleep_need(base_hours)
         sleep_sub = scoring.sleep_score(
-            hours, need=None, deep_rem_frac=deep_rem_frac,
+            hours, need=need_h, deep_rem_frac=deep_rem_frac,
             awakenings=tonight["awakenings"], regularity=regularity)
         subscores["sleep"] = sleep_sub
+        confidences["sleep"] = scoring.metric_confidence(len(base_hours))
         metrics["sleep"] = {
+            "need_h": round(need_h, 2),
             "hours_asleep": round(hours, 2) if hours else None,
             "deep_rem_frac": round(deep_rem_frac, 3)
             if deep_rem_frac is not None else None,
@@ -942,11 +974,38 @@ def _compute_recovery(date: Optional[str] = None) -> dict:
     else:
         subscores["sleep"] = None
 
-    rec = scoring.recovery_score(subscores)
+    # HRV variability-collapse contributor (Phase 3.1): CV of the recent (log)
+    # HRV window scored against the baseline distribution of rolling CVs.
+    if scoring.DEFAULT_CONFIG.hrv_cv_enabled:
+        def _logv(xs):
+            if scoring.DEFAULT_CONFIG.hrv_log_transform:
+                return [math.log(v) for v in xs if v is not None and v > 0]
+            return [v for v in xs if v is not None]
+        cv_today = scoring.cv(_logv(hrv_recent_for_cv))
+        base_cvs = scoring.rolling_cvs(_logv(hrv_base_for_cv),
+                                       scoring.DEFAULT_CONFIG.hrv_smoothing_days)
+        cv_sub = scoring.hrv_cv_score(cv_today, base_cvs)
+        subscores["hrv_cv"] = cv_sub
+        confidences["hrv_cv"] = scoring.metric_confidence(len(base_cvs))
+        metrics["hrv_cv"] = {
+            "metric": "hrv_cv",
+            "cv_today": round(cv_today, 4) if cv_today is not None else None,
+            "baseline_n": len(base_cvs),
+            "subscore": cv_sub,
+            "note": "Day-to-day HRV variability vs baseline; a collapse is an "
+                    "early overreaching sign.",
+        }
+
+    rec = scoring.recovery_score(subscores, confidences=confidences)
     present = [k for k, v in subscores.items() if v is not None]
+    # State: calibrating when history is short OR the aggregate confidence is below
+    # the OK threshold (Phase 4.1), not any-single-metric-below-10.
+    agg_conf = rec.get("confidence")
+    low_conf_agg = (agg_conf is not None
+                    and agg_conf < scoring.DEFAULT_CONFIG.confidence_ok_threshold)
     if not present:
         state = "insufficient_data"
-    elif history_days < MIN_HISTORY_DAYS:
+    elif history_days < MIN_HISTORY_DAYS or low_conf_agg:
         state = "calibrating"
     else:
         state = "ok"
@@ -956,6 +1015,8 @@ def _compute_recovery(date: Optional[str] = None) -> dict:
         "history_days": history_days,
         "score": rec["score"],
         "band": rec["band"],
+        "confidence": rec["confidence"],
+        "ci": rec["ci"],
         "contributors": rec["contributors"],
         "subscores": subscores,
         "metrics": metrics,
@@ -1037,7 +1098,11 @@ def _acwr_for_date(target: str) -> Optional[dict]:
     load_by_day = {d["date"]: d["load"] for d in daily_ext}
     dates = [str(d) for d in span]
     loads = [load_by_day.get(str(d), 0.0) for d in span]
-    series = analytics.acwr(dates, loads, min_history_date=_dataset_start())
+    cfg = scoring.DEFAULT_CONFIG
+    series = analytics.acwr(dates, loads, acute_days=cfg.acwr_acute_days,
+                            chronic_days=cfg.acwr_chronic_days,
+                            min_history_date=_dataset_start(),
+                            uncoupled=cfg.acwr_uncoupled)
     return next((a for a in series if a["date"] == target), None)
 
 
@@ -1068,9 +1133,14 @@ def get_readiness(date: Optional[str] = None) -> dict:
     rest, _ = analytics.resolve_resting_hr(_q, None)
     rec_time = _recovery_time_hours(target, hr_max, rest)
 
+    # Directional z-scores for the Phase 1.3 illness detector (temp/resp/
+    # sleeping-HR up + HRV down co-elevation caps readiness advisorily).
+    illness_z = {m: rec["metrics"].get(m, {}).get("z")
+                 for m in ("hrv", "sleeping_hr", "resp", "temp")}
     out = scoring.readiness_score(rec["score"], acwr_val,
                                   acute_load=acute_load,
-                                  recovery_time_hours=rec_time)
+                                  recovery_time_hours=rec_time,
+                                  illness_zscores=illness_z)
     return {
         "date": target,
         "state": rec["state"],
@@ -1086,6 +1156,7 @@ def get_readiness(date: Optional[str] = None) -> dict:
             "penalty": out["penalty"],
         },
         "recommendation": out["recommendation"],
+        "illness": out.get("illness"),
         "recovery": rec,
         "low_confidence_metrics": rec.get("low_confidence_metrics", []),
         "note": ("Readiness = Recovery - load penalty (ACWR + recovery owed)."

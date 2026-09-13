@@ -47,8 +47,9 @@ def test_subscore_baseline_point_and_monotonicity():
     assert scoring.hrv_score(1) > 50 > scoring.hrv_score(-1)
     assert scoring.rhr_score(1) < 50 < scoring.rhr_score(-1)
     assert scoring.resp_score(1) < 50 < scoring.resp_score(-1)
-    # Temperature falls off symmetrically in either direction.
-    assert scoring.temp_score(1) == scoring.temp_score(-1) < 100
+    # Temperature is asymmetric: a warm deviation is penalized more than an
+    # equal-magnitude cool one (Phase 3.2), both below the on-baseline 100.
+    assert scoring.temp_score(1) < scoring.temp_score(-1) < 100
     # None input -> None sub-score (omitted downstream).
     assert scoring.hrv_score(None) is None
 
@@ -65,8 +66,11 @@ def test_sleep_score_components_and_renormalization():
     full = scoring.sleep_score(8.0, need=8.0, deep_rem_frac=0.45,
                                awakenings=0, regularity=0.0)
     assert full == 100.0
-    # Only duration present -> renormalizes to just that component.
-    assert scoring.sleep_score(4.0, need=8.0) == 50.0
+    # Only duration present -> renormalizes to just that component; under-sleep by
+    # 4 h on the Phase 3.3 curve is 100 - 20*4 = 20.
+    assert scoring.sleep_score(4.0, need=8.0) == 20.0
+    # A big oversleep no longer maxes out.
+    assert scoring.sleep_score(11.0, need=8.0) < 100.0
     assert scoring.sleep_score(None) is None
 
 
@@ -102,6 +106,101 @@ def test_readiness_penalty_above_1_5():
     assert out["penalty"] > 0
     assert out["score"] < 70.0
     assert "elevated" in out["recommendation"].lower()
+
+
+def test_ewma_baseline_tracks_recent_shift():
+    # Sustained upward step: the EWMA center sits above the flat mean because it
+    # weights the recent level more (Phase 2.1).
+    vals = [50.0] * 10 + [70.0] * 10          # oldest -> newest
+    classic = scoring.ScoringConfig(baseline_estimator="classic",
+                                    baseline_ewma=False, winsorize_enabled=False)
+    ewma = scoring.ScoringConfig(baseline_estimator="classic",
+                                 baseline_ewma=True, winsorize_enabled=False)
+    assert scoring.baseline_stats(vals, classic)[0] == 60.0
+    assert scoring.baseline_stats(vals, ewma)[0] > 60.0
+
+
+def test_robust_resists_single_outlier():
+    # One extreme artifact barely moves the robust scale but blows up classic SD
+    # (Phase 2.2).
+    clean = [50.0, 52, 48, 51, 49, 53, 47, 50, 52, 48]
+    dirty = clean[:-1] + [500.0]
+    rob = scoring.ScoringConfig(baseline_estimator="robust")
+    cla = scoring.ScoringConfig(baseline_estimator="classic",
+                                baseline_ewma=False, winsorize_enabled=False)
+    rob_delta = abs(scoring.baseline_stats(dirty, rob)[1]
+                    - scoring.baseline_stats(clean, rob)[1])
+    cla_delta = abs(scoring.baseline_stats(dirty, cla)[1]
+                    - scoring.baseline_stats(clean, cla)[1])
+    assert rob_delta < 2.0
+    assert cla_delta > 50 * rob_delta
+
+
+def test_confidence_downweights_immature_metric():
+    # A high HRV with thin (immature) baseline should count for less, pulling the
+    # score toward the confident metric, and widen the CI (Phase 4.1).
+    subs = {"hrv": 90.0, "sleeping_hr": 50.0}
+    full = scoring.recovery_score(subs, confidences={"hrv": 1.0, "sleeping_hr": 1.0})
+    thin = scoring.recovery_score(subs, confidences={"hrv": 0.2, "sleeping_hr": 1.0})
+    assert thin["score"] < full["score"]
+    assert full["confidence"] == 1.0 and full["ci"] == 0.0
+    assert thin["confidence"] < 1.0 and thin["ci"] > 0.0
+    # Insufficient data still yields no score/confidence.
+    empty = scoring.recovery_score({"hrv": None})
+    assert empty["score"] is None and empty["confidence"] is None
+
+
+def test_sleep_curve_and_personal_need():
+    # Big oversleep no longer scores 100, and an equal-magnitude under-sleep is
+    # penalized more steeply than the over-sleep (Phase 3.3).
+    assert scoring.sleep_score(11.0, need=8.0) < 100.0
+    assert scoring.sleep_score(6.0, need=8.0) < scoring.sleep_score(10.0, need=8.0)
+    # Personalized need tracks the user's own median, clamped to [6.5, 9.0].
+    assert scoring.personalized_sleep_need([7.5, 7.0, 8.0, 7.2, 7.8, 7.1]) == 7.35
+    assert scoring.personalized_sleep_need([6.0, 5.5, 6.2]) == 8.0   # immature -> default
+    assert scoring.personalized_sleep_need([5.0] * 6) == 6.5         # clamped to min
+
+
+def test_temp_asymmetric_and_cycle_hook():
+    # Warm deviation penalized more than an equal-magnitude cool one (Phase 3.2).
+    assert scoring.temp_score(1.5) < scoring.temp_score(-1.5)
+    # Cycle hook is inert without cycle data (luteal defaults False -> no shift).
+    assert scoring.temp_score(1.5) == scoring.temp_score(1.5, luteal=False)
+    # A known luteal phase forgives the predictable warm rise (scores higher).
+    assert scoring.temp_score(1.5, luteal=True) > scoring.temp_score(1.5, luteal=False)
+
+
+def test_hrv_cv_collapse_lowers_recovery():
+    # Baseline days carry normal HRV variability; a recent flatline collapses the
+    # CV far below baseline -> hrv_cv sub-score < 50 -> recovery is pulled down
+    # vs a normal-variability day (Phase 3.1).
+    base = [0.020, 0.030, 0.025, 0.028, 0.022, 0.031, 0.026, 0.024, 0.029, 0.027]
+    collapsed = scoring.hrv_cv_score(0.004, base)
+    normal = scoring.hrv_cv_score(0.026, base)
+    assert collapsed is not None and collapsed < 40.0
+    assert normal is not None and abs(normal - 50.0) < 15.0
+    # In the mix, the collapsed day scores lower recovery than the normal day.
+    subs_ok = {"hrv": 70.0, "hrv_cv": normal}
+    subs_bad = {"hrv": 70.0, "hrv_cv": collapsed}
+    assert (scoring.recovery_score(subs_bad)["score"]
+            < scoring.recovery_score(subs_ok)["score"])
+
+
+def test_illness_detector_caps_and_warns():
+    # Sick day: sleeping HR / temp / resp up and HRV down together -> detector
+    # fires, readiness capped at the yellow ceiling, warning appended.
+    sick = {"temp": 1.6, "resp": 1.4, "sleeping_hr": 1.2, "hrv": -1.5}
+    out = scoring.readiness_score(85.0, acwr=1.0, illness_zscores=sick)
+    assert out["illness"]["triggered"] is True
+    assert out["illness"]["count"] == 4
+    assert out["score"] <= scoring.DEFAULT_CONFIG.illness_readiness_cap
+    assert "illness signals" in out["recommendation"].lower()
+    # Normal day: at most one signal -> detector inert, no cap, no warning.
+    normal = {"temp": 0.2, "resp": -0.1, "sleeping_hr": 0.3, "hrv": 0.4}
+    out2 = scoring.readiness_score(85.0, acwr=1.0, illness_zscores=normal)
+    assert out2["illness"]["triggered"] is False
+    assert out2["score"] == 85.0
+    assert "illness" not in out2["recommendation"].lower()
 
 
 # --- synthetic export for the tools ------------------------------------------

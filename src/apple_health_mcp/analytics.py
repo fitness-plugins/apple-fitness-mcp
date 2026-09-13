@@ -272,35 +272,49 @@ def decoupling(ratio_first: Optional[float],
 
 
 def acwr(dates: list, loads: list[float], acute_days: int = 7,
-         chronic_days: int = 28, min_history_date=None) -> list[dict]:
+         chronic_days: int = 28, min_history_date=None,
+         uncoupled: bool = True) -> list[dict]:
     """Acute:chronic workload ratio over a contiguous daily load series.
 
-    acute = sum of the last `acute_days` (incl. today); chronic = sum of the last
-    `chronic_days` expressed as a weekly-equivalent (/ (chronic_days/acute_days)).
+    acute = sum of the last `acute_days` (incl. today); chronic = the chronic
+    window expressed as an acute-length-equivalent (steady load -> ratio 1.0).
+    When `uncoupled` (default) the chronic window *excludes* the acute tail —
+    days `[i-chronic_days .. i-acute_days)`, a `chronic_days - acute_days` span —
+    so acute and chronic are not the spuriously-correlated overlapping windows
+    the coupled form uses (the 7-day acute period sitting inside the 28-day
+    chronic one). The legacy coupled window stays selectable via `uncoupled=False`.
     Flags: 'sweet_spot' 0.8–1.3, 'elevated' > 1.5, else 'low'/'moderate'.
-    `dates`/`loads` must be day-contiguous and equal length.
+    `dates`/`loads` must be day-contiguous and equal length. Mirrors the pure
+    single-point `scoring.acwr_ratio`.
 
     `min_history_date` (a `date`) is the earliest day the whole dataset has any
     data. When given, `insufficient_history` reflects real history — a date is
     "enough" once >= `chronic_days` precede it in the dataset — rather than the
     series index, so a series seeded with pre-range lookback isn't mis-flagged.
     """
+    denom_days = (chronic_days - acute_days) if uncoupled else chronic_days
+    scale = denom_days / acute_days if denom_days > 0 else 1.0
     out = []
-    scale = chronic_days / acute_days
     for i in range(len(loads)):
         acute = sum(loads[max(0, i - acute_days + 1): i + 1])
-        chronic_window = loads[max(0, i - chronic_days + 1): i + 1]
-        chronic = sum(chronic_window) / scale
+        if uncoupled:
+            chronic_window = loads[max(0, i - chronic_days + 1):
+                                   max(0, i - acute_days + 1)]
+        else:
+            chronic_window = loads[max(0, i - chronic_days + 1): i + 1]
+        chronic = (sum(chronic_window) / scale) if chronic_window else 0.0
         ratio = round(acute / chronic, 2) if chronic > 0 else None
         if min_history_date is not None:
             day = datetime.fromisoformat(str(dates[i])).date()
             enough = (day - min_history_date).days >= chronic_days - 1
         else:
             enough = i >= chronic_days - 1
-        if ratio is None:
-            flag = "no_load"
-        elif not enough:
+        # History sufficiency is checked first: an early day with an as-yet-empty
+        # (decoupled) chronic window is 'insufficient_history', not 'no_load'.
+        if not enough:
             flag = "insufficient_history"
+        elif ratio is None:
+            flag = "no_load"
         elif ratio > 1.5:
             flag = "elevated"
         elif ratio < 0.8:
@@ -315,6 +329,7 @@ def acwr(dates: list, loads: list[float], acute_days: int = 7,
             "chronic_28d_weekly": round(chronic, 1),
             "acwr": ratio,
             "flag": flag,
+            "uncoupled": uncoupled,
         })
     return out
 
