@@ -35,6 +35,21 @@ DEFAULT_PLAN_DIR = Path.home() / "Documents" / "AppleFitnessPlans"
 DEFAULT_PLAN_OUTPUT_PATH = DEFAULT_PLAN_DIR / "plan.json"
 PLAN_OUTPUT_PATH = Path(os.environ.get("HEALTH_PLAN_PATH", DEFAULT_PLAN_OUTPUT_PATH))
 
+# Where build_dashboard writes the self-contained progress dashboard. Same local
+# folder as the plan — it is the place the user already looks for outputs, and
+# the file is opened straight from disk (no server, no network). Overridable via
+# HEALTH_DASHBOARD_PATH (used by tests).
+DEFAULT_DASHBOARD_PATH = DEFAULT_PLAN_DIR / "dashboard.html"
+DASHBOARD_OUTPUT_PATH = Path(
+    os.environ.get("HEALTH_DASHBOARD_PATH", DEFAULT_DASHBOARD_PATH))
+
+# Model-written narrative for the dashboard's prose blocks. Optional: the
+# dashboard falls back to its own derived sentences when this is absent or was
+# written for a different data date. Overridable via HEALTH_NARRATIVES_PATH.
+DEFAULT_NARRATIVES_PATH = DEFAULT_PLAN_DIR / "narratives.json"
+NARRATIVES_OUTPUT_PATH = Path(
+    os.environ.get("HEALTH_NARRATIVES_PATH", DEFAULT_NARRATIVES_PATH))
+
 # Where the biweekly recalibration job persists its derived reference values
 # (scripts/recalibration_check.sh -> scripts/calibrate.py --check). Beside the
 # HRV baseline stats this is the file that carries the *calibrated* HR anchors

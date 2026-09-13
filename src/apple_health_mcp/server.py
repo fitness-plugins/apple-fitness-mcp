@@ -20,8 +20,9 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from . import (analytics, config, import_pipeline, scoring, storage,
-               sync_import, sync_pairing, sync_receiver, sync_spool, zones)
+from . import (analytics, config, dashboard, import_pipeline, scoring,
+               storage, sync_import, sync_pairing, sync_receiver, sync_spool,
+               zones)
 
 mcp = FastMCP("apple-health")
 
@@ -1804,6 +1805,35 @@ def get_weekly_plan(path: Optional[str] = None) -> dict:
         return {"status": "error", "path": str(in_path),
                 "error": f"Could not read saved plan: {exc}"}
     return {"status": "saved", "path": str(in_path), "plan_json": plan}
+
+
+@mcp.tool(annotations=WRITE,
+          description="Regenerate the training-progress dashboard: a single "
+                      "self-contained HTML file (all data inlined, no network, "
+                      "opens offline from disk) written to "
+                      "~/Documents/AppleFitnessPlans/dashboard.html by default. "
+                      "Four tabs: Last 30 days, Running, The engine, Load & "
+                      "recovery. Call this after reload_data to refresh it with "
+                      "new export data, or whenever the user asks to see or "
+                      "update their dashboard. Corrects three defects in the raw "
+                      "export that materially change the numbers — duplicate "
+                      "workout records, sleep segments double-counted across "
+                      "iPhone and Watch, and steps/energy summed over every "
+                      "device — so its figures will not match a naive SUM over "
+                      "the tables. Pass `path` to write elsewhere. Returns the "
+                      "written path plus headline figures; tell the user to open "
+                      "the path in a browser.")
+def build_dashboard(path: Optional[str] = None) -> dict:
+    _ensure_ready()
+    try:
+        return dashboard.build(path)
+    except ValueError as exc:
+        # Empty / unimported DB — actionable, not an internal error.
+        return {"status": "empty", "error": str(exc),
+                "hint": "Run reload_data (or `uv run apple-health-import`) first."}
+    except OSError as exc:
+        return {"status": "error",
+                "error": f"Could not write the dashboard: {exc}"}
 
 
 # --- LAN delta sync from the iPhone app ---------------------------------------
