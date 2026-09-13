@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Biweekly (14-day) recalibration drift check - Phase 4.3.
+
+  Runs scripts/recalibration_check.sh, which calls calibrate.py --check and fires
+  a notification ONLY when the HRV baseline reference has drifted past tolerance.
+  Nothing here changes the live scoring path.
+
+  Install:
+    cp launchd/com.applehealth.recalibration.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.applehealth.recalibration.plist
+
+  IMPORTANT: the two absolute paths below must match your checkout location.
+  StartInterval is 1209600 seconds = 14 days. launchd runs it that often while
+  loaded, catching up a missed run if the machine was asleep.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.applehealth.recalibration</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/bottleofjuice/Documents/projects/apple-fitness-mcp/scripts/recalibration_check.sh</string>
+    </array>
+
+    <!-- 14 days. -->
+    <key>StartInterval</key>
+    <integer>1209600</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/bottleofjuice/Documents/projects/apple-fitness-mcp/logs/recalibration.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/bottleofjuice/Documents/projects/apple-fitness-mcp/logs/recalibration.err.log</string>
+</dict>
+</plist>
