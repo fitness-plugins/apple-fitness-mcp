@@ -141,9 +141,10 @@ you want, whichever is easiest:
 
 ## MCP tools
 
-All query tools are **read-only** (marked with `readOnlyHint`). The single
-exception is `reload_data`, which imports new data on demand — it only ever
-*adds* records (non-destructive, idempotent) and is annotated accordingly.
+All query tools are **read-only** (marked with `readOnlyHint`). The exceptions
+are `reload_data`, which imports new data on demand (it only ever *adds*
+records — non-destructive and idempotent), `save_weekly_plan`, and
+`build_dashboard`, which writes an HTML file.
 
 | Tool | What it returns | Example question to Claude |
 |------|-----------------|----------------------------|
@@ -158,12 +159,49 @@ exception is `reload_data`, which imports new data on demand — it only ever
 | `get_workouts(start_date, end_date, type?)` | Workouts, optionally by type | "List my runs in May and their average heart rate." |
 | `run_sql(query)` | Read-only SELECT over the DB | "Which weekday do I walk the most?" |
 | `reload_data(force?)` | Imports the newest export from the drop-folder now | "I just exported fresh data — reload it." |
+| `build_dashboard(path?)` | Regenerates the progress dashboard as one self-contained HTML file | "Rebuild my dashboard." |
 
 `run_sql` accepts only a single `SELECT`/`WITH` statement; all DDL/DML is
 rejected and the connection is opened read-only as a second safeguard.
 
 Tables available to `run_sql`: `records`, `records_dedup` (deduplicated view),
 `workouts`, `sleep`, `activity_summary`, `clinical`.
+
+## The progress dashboard
+
+`build_dashboard` writes a single self-contained HTML file — every style, script
+and data point inlined — to `~/Documents/AppleFitnessPlans/dashboard.html`
+(override with `HEALTH_DASHBOARD_PATH`, or pass `path`). It has no external
+assets and makes no network requests, so it opens straight from disk and keeps
+working offline. Four tabs: **Last 30 days**, **Running**, **The engine**
+(resting HR, HRV, HR recovery, VO2 max), and **Load & recovery**.
+
+Typical refresh, after dropping a new export in the folder:
+
+```
+"Reload my health data and rebuild the dashboard"
+   -> reload_data() then build_dashboard()
+```
+
+Or without Claude at all:
+
+```bash
+uv run python -c "from apple_health_mcp import dashboard; print(dashboard.build())"
+```
+
+**Its numbers will not match a naive `SUM` over the tables, deliberately.** The
+raw export is wrong in three ways that materially change training metrics, and
+the dashboard corrects all three (see `src/apple_health_mcp/dashboard.py`):
+
+1. **Workouts are stored 2–3 times** — repeated exports and watch renames create
+   copies. Deduped on `(type, start minute)`. On a real export this is 280 rows
+   → 142 workouts; uncorrected it claims 78 runs where there are 41, and doubles
+   weekly mileage.
+2. **Sleep segments overlap across iPhone and Watch** — summing them reports
+   ~15 h a night. The night total is the interval *union*: ~7.5 h.
+3. **Steps and energy are counted by every device at once** — summing all
+   sources gives ~30,000 steps/day; taking the highest single source per day
+   gives ~14,000.
 
 ## Deduplication
 
