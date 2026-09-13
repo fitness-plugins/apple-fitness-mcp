@@ -26,6 +26,15 @@ STATE_DIR = PROJECT_ROOT / "data"
 IMPORT_STATE_PATH = STATE_DIR / "import_state.json"
 LOG_DIR = PROJECT_ROOT / "logs"
 
+# Where save_weekly_plan writes the WeeklyPlan JSON the iOS app reads. A free
+# Apple developer team can't use iCloud containers, so the plan is written to a
+# plain LOCAL folder the user AirDrops / shares from — no iCloud sync.
+# Overridable via HEALTH_PLAN_PATH (used by tests). Kept as a Path; unlike the
+# old iCloud path, this local dir SHOULD exist and is created in ensure_dirs().
+DEFAULT_PLAN_DIR = Path.home() / "Documents" / "AppleFitnessPlans"
+DEFAULT_PLAN_OUTPUT_PATH = DEFAULT_PLAN_DIR / "plan.json"
+PLAN_OUTPUT_PATH = Path(os.environ.get("HEALTH_PLAN_PATH", DEFAULT_PLAN_OUTPUT_PATH))
+
 # Where the biweekly recalibration job persists its derived reference values
 # (scripts/recalibration_check.sh -> scripts/calibrate.py --check). Beside the
 # HRV baseline stats this is the file that carries the *calibrated* HR anchors
@@ -92,7 +101,7 @@ def source_priority(source_name: str | None) -> int:
 
 def ensure_dirs() -> None:
     """Create the directories the pipeline writes to."""
-    for d in (DB_PATH.parent, STATE_DIR, LOG_DIR, EXPORT_DIR):
+    for d in (DB_PATH.parent, STATE_DIR, LOG_DIR, EXPORT_DIR, DEFAULT_PLAN_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

@@ -7,9 +7,14 @@ client over stdio.
 from __future__ import annotations
 
 import atexit
+import json
 import math
+import os
 import re
-from datetime import timedelta
+import tempfile
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -1604,6 +1609,201 @@ def run_sql(query: str) -> dict:
                       "'error', with row-count totals.")
 def reload_data(force: bool = False) -> dict:
     return import_pipeline.reload(force=force)
+
+
+# --- weekly training plan (write to a local folder the user shares from) --------
+
+_WEEKDAYS = {"monday", "tuesday", "wednesday", "thursday", "friday",
+             "saturday", "sunday"}
+
+
+def _is_iso_date(value: Any) -> bool:
+    """True if value is a 'YYYY-MM-DD' string (a calendar date, no time)."""
+    if not isinstance(value, str):
+        return False
+    try:
+        from datetime import date as _date
+        _date.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_and_fill_plan(plan: dict) -> dict:
+    """Validate a WeeklyPlan against the MCP<->app contract and fill identity
+    fields. Returns a NEW filled dict; raises ValueError listing every problem on
+    invalid input.
+
+    Contract (see apple-fitness-ios/IOS_TRAINING_PLAN_PROMPTS.md, "WeeklyPlan JSON
+    schema"):
+      required: schema_version (int), week_of (ISO date, the Monday), planned
+        (non-empty list); each item has id (non-empty, unique str) + constraints
+        (an object — an OPEN map, contents not validated here, the app owns that).
+      optional per item: title, notes, day (monday..sunday or null), generated_by.
+      plan_id (UUID) and generated_at (ISO-8601 UTC) are FILLED if absent; a
+        provided plan_id is preserved (lets a caller re-save a specific version).
+    """
+    if not isinstance(plan, dict):
+        raise ValueError("plan must be a JSON object (dict).")
+
+    errors: list[str] = []
+    out = dict(plan)  # shallow copy; we don't mutate the caller's dict
+
+    sv = out.get("schema_version")
+    if sv is None:
+        errors.append("schema_version is required (int).")
+    elif not isinstance(sv, int) or isinstance(sv, bool):
+        errors.append("schema_version must be an int.")
+
+    week_of = out.get("week_of")
+    if week_of is None:
+        errors.append("week_of is required (ISO date 'YYYY-MM-DD', the Monday of "
+                      "the week).")
+    elif not _is_iso_date(week_of):
+        errors.append("week_of must be an ISO date string 'YYYY-MM-DD'.")
+
+    planned = out.get("planned")
+    if not isinstance(planned, list) or not planned:
+        errors.append("planned is required and must be a non-empty list.")
+    else:
+        seen_ids: set[str] = set()
+        for i, item in enumerate(planned):
+            if not isinstance(item, dict):
+                errors.append(f"planned[{i}] must be an object.")
+                continue
+            pid = item.get("id")
+            if not isinstance(pid, str) or not pid.strip():
+                errors.append(f"planned[{i}].id is required and must be a "
+                              "non-empty string.")
+            elif pid in seen_ids:
+                errors.append(f"planned[{i}].id '{pid}' is duplicated; ids must be "
+                              "unique within the plan.")
+            else:
+                seen_ids.add(pid)
+            if not isinstance(item.get("constraints"), dict):
+                errors.append(f"planned[{i}].constraints is required and must be "
+                              "an object (map of constraint name -> params).")
+            day = item.get("day")
+            if day is not None and day not in _WEEKDAYS:
+                errors.append(f"planned[{i}].day must be one of monday..sunday or "
+                              "null.")
+
+    # plan_id: keep a provided one (must be a valid UUID); else mint a new one.
+    plan_id = out.get("plan_id")
+    if plan_id is None:
+        out["plan_id"] = str(uuid.uuid4())
+    else:
+        try:
+            out["plan_id"] = str(uuid.UUID(str(plan_id)))
+        except (ValueError, AttributeError, TypeError):
+            errors.append("plan_id, if provided, must be a valid UUID.")
+
+    # generated_at: fill with now (UTC) if absent; keep a provided value as-is.
+    if not out.get("generated_at"):
+        out["generated_at"] = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+
+    if errors:
+        raise ValueError("Invalid WeeklyPlan: " + "; ".join(errors))
+    return out
+
+
+def _atomic_write_json(path: Path, obj: dict) -> None:
+    """Write pretty UTF-8 JSON to `path` atomically (temp file in the same dir,
+    then os.replace) so a reader never sees a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".plan-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+@mcp.tool(annotations=WRITE,
+          description="Save a WeeklyPlan JSON to a local folder so the user can "
+                      "share it to the iOS training app (writes "
+                      "~/Documents/AppleFitnessPlans/plan.json by default — a "
+                      "plain local file, no iCloud, no network calls from here). "
+                      "Call this AFTER you have composed a WeeklyPlan from the "
+                      "user's recovery/training-load/workout data. The plan is a "
+                      "JSON object: schema_version (int), week_of (ISO date, the "
+                      "Monday), and a non-empty 'planned' list of {id, "
+                      "constraints{...}, optional title/notes/day}. plan_id and "
+                      "generated_at are filled automatically if omitted. "
+                      "IMPORTANT: omitting plan_id mints a NEW plan version the "
+                      "app re-matches from scratch (crediting already-done "
+                      "workouts); pass the SAME plan_id to re-save a specific "
+                      "version idempotently (the app dedupes by plan_id). Returns "
+                      "the written path plus the filled plan_json so you can show "
+                      "it or the user can AirDrop / share the file to their phone.")
+def save_weekly_plan(plan: Any, path: Optional[str] = None) -> dict:
+    # MCP passes JSON objects as dicts; also accept a JSON string defensively.
+    if isinstance(plan, str):
+        try:
+            plan = json.loads(plan)
+        except json.JSONDecodeError as exc:
+            return {"status": "invalid", "errors": [f"plan is not valid JSON: {exc}"]}
+
+    try:
+        filled = validate_and_fill_plan(plan)
+    except ValueError as exc:
+        # Strip the "Invalid WeeklyPlan: " prefix and split back into a list.
+        msg = str(exc)
+        detail = msg.split("Invalid WeeklyPlan: ", 1)[-1]
+        errors = [e.strip() for e in detail.split(";") if e.strip()]
+        return {"status": "invalid", "errors": errors or [msg]}
+
+    out_path = Path(path) if path else config.PLAN_OUTPUT_PATH
+
+    # The destination is a plain local folder; _atomic_write_json creates parent
+    # dirs and writes atomically. If the write genuinely fails (e.g. permissions),
+    # hand back the filled plan so the user can still share it manually.
+    try:
+        _atomic_write_json(out_path, filled)
+    except OSError as exc:
+        return {
+            "status": "error",
+            "hint": f"Could not write to {out_path}: {exc}. Share plan_json "
+                    "manually instead.",
+            "plan_json": filled,
+        }
+
+    return {
+        "status": "saved",
+        "plan_id": filled["plan_id"],
+        "week_of": filled["week_of"],
+        "planned_count": len(filled["planned"]),
+        "path": str(out_path),
+        "plan_json": filled,
+    }
+
+
+@mcp.tool(annotations=RO,
+          description="Read back the currently-saved WeeklyPlan (the plan.json "
+                      "save_weekly_plan last wrote to the local plans folder, "
+                      "~/Documents/AppleFitnessPlans/ by default). Use it to "
+                      "answer 'what's my current plan?'. Returns {status:'none'} "
+                      "when no plan has been saved yet.")
+def get_weekly_plan(path: Optional[str] = None) -> dict:
+    in_path = Path(path) if path else config.PLAN_OUTPUT_PATH
+    if not in_path.exists():
+        return {"status": "none",
+                "note": f"No saved plan at {in_path}. Compose one and call "
+                        "save_weekly_plan."}
+    try:
+        with open(in_path, encoding="utf-8") as fh:
+            plan = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"status": "error", "path": str(in_path),
+                "error": f"Could not read saved plan: {exc}"}
+    return {"status": "saved", "path": str(in_path), "plan_json": plan}
 
 
 # --- LAN delta sync from the iPhone app ---------------------------------------
