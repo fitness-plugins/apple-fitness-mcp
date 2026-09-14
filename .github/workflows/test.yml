@@ -1,0 +1,30 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      # A full checkout is required, not just src/ and tests/:
+      # tests/test_calibrate.py and tests/test_row_hash.py load
+      # scripts/calibrate.py and scripts/migrate_row_hash.py by path, and
+      # tests/test_zones.py reads config/training_zones.json. Do not add a
+      # sparse checkout or path filters that drop scripts/ or config/.
+      - uses: actions/checkout@v7
+
+      # Python version: pyproject.toml only sets a floor (requires-python
+      # ">=3.11"). The concrete version is pinned in .python-version (3.12),
+      # which uv reads automatically. Do not let it float to the newest
+      # release: 3.14 lacks wheels for duckdb.
+      - uses: astral-sh/setup-uv@v10.1.0
+
+      # --locked fails the job if uv.lock is out of date with pyproject.toml,
+      # instead of silently re-resolving.
+      - run: uv sync --locked
+      - run: uv run pytest -q

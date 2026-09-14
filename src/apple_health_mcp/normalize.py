@@ -99,12 +99,44 @@ def normalize_sleep_stage(value: str | None) -> str:
 # Apple export timestamps look like: "2024-01-15 08:30:00 -0800"
 _TS_FORMATS = ("%Y-%m-%d %H:%M:%S %z",)
 
+# Length of that exact shape; the offset sign sits at index 20, the space at 19.
+_APPLE_TS_LEN = len("2024-01-15 08:30:00 -0800")
+
 
 def parse_ts(value: str | None) -> datetime | None:
-    """Parse an Apple Health timestamp into a timezone-aware datetime."""
+    """Parse an Apple Health timestamp into a timezone-aware datetime.
+
+    This is the hottest function in the whole import: three calls per <Record>,
+    ~7.7M calls on a real full export. ``datetime.strptime`` costs ~3.2 us a
+    call, ``datetime.fromisoformat`` ~0.09 us, so the format is rewritten into
+    strict ISO-8601 first and only unrecognized shapes fall through to the
+    original strptime / ISO path.
+
+    Apple's format is ISO-8601 apart from the space before the UTC offset::
+
+        "2024-01-15 08:30:00 -0800"  ->  "2024-01-15 08:30:00-08:00"
+
+    Dropping the space alone ("...00-0800") is enough for Python >= 3.11, which
+    is what this project runs (``.python-version`` pins 3.12, ``pyproject``
+    requires >=3.11). Python 3.10's ``fromisoformat`` only accepts what
+    ``isoformat()`` emits and rejects a colonless offset, so the colon is
+    inserted as well: the same one expression is then correct on 3.10 too and
+    the fast path cannot be silently lost on an older interpreter. Measured
+    here on 3.10, guard + rewrite + parse is 0.22 us vs 3.22 us for strptime.
+    """
     if not value:
         return None
     value = value.strip()
+    if (len(value) == _APPLE_TS_LEN and value[19] == " "
+            and (value[20] == "+" or value[20] == "-")):
+        try:
+            return datetime.fromisoformat(
+                value[:19] + value[20:23] + ":" + value[23:]
+            )
+        except ValueError:
+            # Well-shaped but not a real instant (e.g. month 13) -- let the
+            # slow path have its say rather than guessing.
+            pass
     for fmt in _TS_FORMATS:
         try:
             return datetime.strptime(value, fmt)

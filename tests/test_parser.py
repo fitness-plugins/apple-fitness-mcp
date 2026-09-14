@@ -5,6 +5,7 @@ No real personal data is used — a tiny export.xml is built inline.
 from __future__ import annotations
 
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -83,6 +84,56 @@ def test_parse_ts_bad_input():
     assert normalize.parse_ts(None) is None
 
 
+def test_parse_ts_fast_path_matches_strptime():
+    """The ISO rewrite must agree with strptime on every offset shape."""
+    for raw, offset_hours in [
+        ("2024-01-15 08:30:00 -0800", -8),
+        ("2024-05-01 08:00:00 +0300", 3),
+        ("2024-05-01 08:00:00 +0000", 0),
+        ("2024-05-01 08:00:00 +0530", 5.5),
+        ("2024-12-31 23:59:59 -1200", -12),
+    ]:
+        fast = normalize.parse_ts(raw)
+        slow = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S %z")
+        assert fast == slow
+        assert fast.utcoffset() == slow.utcoffset()
+        assert fast.utcoffset().total_seconds() == offset_hours * 3600
+
+
+def test_parse_ts_uses_fromisoformat_for_the_apple_shape(monkeypatch):
+    """Apple's own format must never reach strptime — it is 36x slower.
+
+    parse_ts runs three times per <Record>, ~7.7M times on a real export, so
+    this is the difference between ~1 s and ~40 s of every full import.
+    """
+    class NoStrptime(datetime):
+        @classmethod
+        def strptime(cls, *args, **kwargs):
+            raise AssertionError("strptime used for the Apple timestamp shape")
+
+    monkeypatch.setattr(normalize, "datetime", NoStrptime)
+    ts = normalize.parse_ts("2024-01-15 08:30:00 -0800")
+    assert ts == datetime(2024, 1, 15, 8, 30,
+                          tzinfo=timezone(timedelta(hours=-8)))
+
+
+def test_parse_ts_other_shapes_still_parse():
+    """Anything that is not Apple's exact shape keeps the old slow path."""
+    # Plain ISO-8601 (the documented last-resort branch).
+    assert normalize.parse_ts("2024-01-15T08:30:00+00:00") == datetime(
+        2024, 1, 15, 8, 30, tzinfo=timezone.utc)
+    # Naive: no offset at all.
+    assert normalize.parse_ts("2024-01-15 08:30:00") == datetime(2024, 1, 15, 8, 30)
+    assert normalize.parse_ts("2024-01-15") == datetime(2024, 1, 15)
+    # Right length and a space, but the offset is junk -> None, not a crash.
+    assert normalize.parse_ts("2024-01-15 08:30:00 XXXXX") is None
+    # Right shape, impossible instant -> None.
+    assert normalize.parse_ts("2024-13-45 08:30:00 -0800") is None
+    # Surrounding whitespace is still tolerated.
+    assert normalize.parse_ts("  2024-01-15 08:30:00 -0800  ") == datetime(
+        2024, 1, 15, 8, 30, tzinfo=timezone(timedelta(hours=-8)))
+
+
 # --- parser -------------------------------------------------------------------
 
 def test_iter_export_counts(tmp_path):
@@ -91,6 +142,9 @@ def test_iter_export_counts(tmp_path):
     kinds = [k for k, _ in parser.iter_export(xml)]
     assert kinds.count("record") == 6
     assert kinds.count("workout") == 1
+    # That workout has <WorkoutStatistics> but no structure (no <WorkoutEvent>
+    # / <WorkoutActivity>), so it contributes no workout_event rows.
+    assert kinds.count("workout_event") == 0
     assert kinds.count("sleep") == 1          # sleep is emitted in addition to record
     assert kinds.count("activity_summary") == 1
 

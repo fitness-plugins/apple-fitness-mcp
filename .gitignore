@@ -1,12 +1,19 @@
 # --- Personal / private data (never commit real health data) ---
 data/
 logs/
-*.duckdb
-*.duckdb.wal
-export.xml
-export_cda.xml
+# DuckDB file plus every sidecar it writes (.wal, .tmp, ...).
+*.duckdb*
+# export.xml, export_cda.xml, and any renamed copy (export-2026-09.xml, ...).
+export*.xml
 *.zip
 apple_health_export/
+# Holds the LAN-sync shared secret (token + device id). Already covered by
+# data/ above; listed explicitly so it stays ignored even if data/ is ever
+# narrowed.
+data/sync_pairing.json
+
+# --- Editor / manual backups (dashboard.py.bak3, *.bak, *.bak2, ...) ---
+*.bak*
 
 # --- Local Claude Code settings (machine-specific permissions) ---
 .claude/settings.local.json

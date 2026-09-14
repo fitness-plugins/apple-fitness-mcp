@@ -151,6 +151,12 @@ def _install(tmp_path, monkeypatch, xml: str):
     monkeypatch.setattr(config, "STATE_DIR", tmp_path)
     monkeypatch.setattr(config, "IMPORT_STATE_PATH", tmp_path / "import_state.json")
     monkeypatch.setattr(config, "LOG_DIR", tmp_path / "logs")
+    # The HR anchors resolve through `zones`, which reads the recalibration
+    # reference first. Point it at a path that does not exist so these tests
+    # keep exercising the observed-max fallback whatever the recalibration job
+    # has left in data/ on the developer's machine.
+    monkeypatch.setattr(config, "CALIBRATION_REFERENCE_PATH",
+                        tmp_path / "no_calibration.json")
     archive = exp / "export.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("apple_health_export/export.xml", xml)
