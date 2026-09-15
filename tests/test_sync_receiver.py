@@ -30,6 +30,11 @@ BATCH_LINES = [
 ]
 
 
+# The phone's own id. Deliberately unlike the pairing's service id: confusing
+# the two is the bug these tests pin down.
+PHONE_ID = "5C1D3E2A-PHONE-0000-0000-000000000001"
+
+
 def ndjson(lines) -> bytes:
     return "\n".join(json.dumps(line) for line in lines).encode("utf-8")
 
@@ -75,7 +80,7 @@ def post_headers(pairing, batch_id, lines=None, **extra):
                "Content-Type": "application/x-ndjson",
                "Content-Encoding": "gzip",
                "X-Batch-Id": batch_id,
-               "X-Device-Id": pairing["device_id"]}
+               "X-Device-Id": PHONE_ID}
     if lines is not None:
         headers["X-Batch-Lines"] = str(lines)
     headers.update(extra)
@@ -89,7 +94,8 @@ def test_health_endpoint_answers_the_paired_device(live):
     status, body = call(receiver, "/health",
                         headers={"X-Health-Token": pairing["token"]})
     assert status == 200
-    assert body == {"ok": True, "v": 1, "device_id": pairing["device_id"],
+    # Wire key stays "device_id"; the value is the Mac's service id.
+    assert body == {"ok": True, "v": 1, "device_id": pairing["service_id"],
                     "paired": True}
 
 
@@ -130,7 +136,7 @@ def test_a_batch_is_on_disk_before_the_200_comes_back(live):
     spooled = receiver.spool.find("batch-1")
     assert spooled is not None and spooled.state == sync_spool.PENDING
     assert [json.loads(line) for line in spooled.iter_lines()] == BATCH_LINES
-    assert spooled.meta["device_id"] == pairing["device_id"]
+    assert spooled.meta["device_id"] == PHONE_ID
     assert spooled.meta["lines"] == 2
 
 
@@ -286,3 +292,122 @@ def test_a_disabled_listener_says_so(sandbox, monkeypatch):
     receiver = sync_receiver.SyncReceiver(bind_host="127.0.0.1", port=0)
     assert receiver.start(advertise=False) is False
     assert "HEALTH_SYNC_DISABLED" in receiver.status()["error"]
+
+
+# --- identities: the Mac's service id vs the phone's device id --------------
+
+def test_a_batch_records_the_phone_id_and_leaves_the_service_id(live):
+    receiver, pairing = live
+    assert pairing["last_seen_device_id"] is None
+    status, _ = call(receiver, "/batch", data=gzip.compress(ndjson(BATCH_LINES)),
+                     headers=post_headers(pairing, "batch-ident", 2,
+                                          **{"X-Device-Id": "phone-X"}))
+    assert status == 200
+
+    stored = sync_pairing.load()
+    assert stored["last_seen_device_id"] == "phone-X"
+    assert stored["service_id"] == pairing["service_id"]
+    assert stored["token"] == pairing["token"]
+    assert "device_id" not in stored
+
+
+def test_a_batch_without_a_device_header_records_nothing(live):
+    receiver, pairing = live
+    headers = post_headers(pairing, "batch-anon", 2)
+    del headers["X-Device-Id"]
+    assert call(receiver, "/batch", data=gzip.compress(ndjson(BATCH_LINES)),
+                headers=headers)[0] == 200
+    assert sync_pairing.load()["last_seen_device_id"] is None
+
+
+def test_rotation_keeps_both_ids(sandbox):
+    first = sync_pairing.ensure()
+    sync_pairing.note_device("phone-X")
+    rotated = sync_pairing.ensure(rotate=True)
+    assert rotated["token"] != first["token"]
+    assert rotated["service_id"] == first["service_id"]
+    assert rotated["last_seen_device_id"] == "phone-X"
+
+
+def test_a_pre_rename_pairing_file_is_read_as_service_id(sandbox):
+    """Files written before the rename carry the service id as device_id."""
+    config.sync_pairing_path().write_text(json.dumps(
+        {"v": 1, "token": "t" * 43, "device_id": "svc-legacy",
+         "created_at": "2026-08-01T00:00:00+00:00", "rotated_at": None}))
+    assert sync_pairing.service_id() == "svc-legacy"
+    assert sync_pairing.pairing_payload(8765)["device_id"] == "svc-legacy"
+
+    sync_pairing.note_device("phone-X")
+    stored = json.loads(config.sync_pairing_path().read_text())
+    assert stored["service_id"] == "svc-legacy"
+    assert stored["last_seen_device_id"] == "phone-X"
+    assert "device_id" not in stored
+
+
+# --- choosing the LAN address the phone is told to use ----------------------
+
+def test_lan_address_skips_loopback_and_class_e():
+    assert sync_receiver.choose_lan_address(
+        ["127.0.0.1", "240.0.0.2", "192.168.1.14"]) == "192.168.1.14"
+
+
+def test_lan_address_is_none_without_a_private_candidate():
+    assert sync_receiver.choose_lan_address(
+        ["127.0.0.1", "240.0.0.2", "169.254.10.1", "8.8.8.8"]) is None
+    assert sync_receiver.choose_lan_address([]) is None
+
+
+@pytest.mark.parametrize("address", [
+    "127.0.0.1", "127.5.5.5",          # loopback
+    "169.254.1.1",                     # link-local
+    "224.0.0.251", "239.1.1.1",        # multicast
+    "240.0.0.2", "255.255.255.255",    # Class E, reserved
+    "0.0.0.0",
+    "100.64.0.1", "8.8.8.8",           # CGNAT / public: not the Wi-Fi
+    "172.32.0.1", "11.0.0.1",          # just outside the private ranges
+    "fe80::1", "not an ip", "", None,
+])
+def test_non_private_addresses_are_rejected(address):
+    assert sync_receiver.is_private_lan(address) is False
+
+
+@pytest.mark.parametrize("address", [
+    "10.0.0.1", "10.255.255.254", "172.16.0.1", "172.20.10.2",
+    "172.31.255.254", "192.168.0.1", "192.168.255.254",
+])
+def test_private_addresses_are_accepted(address):
+    assert sync_receiver.is_private_lan(address) is True
+
+
+def test_the_default_route_interface_wins_among_several():
+    candidates = ["10.0.0.5", "192.168.1.14"]
+    assert sync_receiver.choose_lan_address(
+        candidates, default_route="192.168.1.14") == "192.168.1.14"
+    # A VPN owning the default route is not a reason to give up on the Wi-Fi.
+    assert sync_receiver.choose_lan_address(
+        candidates, default_route="240.0.0.2") == "10.0.0.5"
+
+
+def test_the_probe_sees_past_a_vpn_default_route(monkeypatch):
+    """The real-world case: a TUN at 240.0.0.2 holds the default route."""
+    monkeypatch.setattr(sync_receiver, "_default_route_address",
+                        lambda: "240.0.0.2")
+    monkeypatch.setattr(sync_receiver, "_interface_addresses",
+                        lambda: ["127.0.0.1", "172.20.10.2", "240.0.0.2"])
+    assert sync_receiver.lan_probe() == (
+        "172.20.10.2", ["240.0.0.2", "127.0.0.1", "172.20.10.2"])
+
+
+def test_status_reports_no_address_rather_than_a_bad_one(live, monkeypatch):
+    receiver, _ = live
+    monkeypatch.setattr(sync_receiver, "_default_route_address",
+                        lambda: "240.0.0.2")
+    monkeypatch.setattr(sync_receiver, "_interface_addresses",
+                        lambda: ["127.0.0.1", "240.0.0.2"])
+    monkeypatch.setattr(receiver, "bind_host", "0.0.0.0")   # as in production
+
+    status = receiver.status()
+    assert status["lan_address"] is None
+    assert status["url"] is None
+    assert "No private LAN address" in status["lan_error"]
+    assert "240.0.0.2" in status["lan_error"]

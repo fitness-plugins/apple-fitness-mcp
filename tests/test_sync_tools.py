@@ -7,6 +7,7 @@ describe is exercised here.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import stat
 
@@ -16,6 +17,7 @@ from apple_health_mcp import (config, server, sync_pairing, sync_receiver,
                               sync_spool)
 from test_sync_import import spool_batch
 from test_sync_protocol import NDJSON_LINES
+from test_sync_receiver import BATCH_LINES, call, ndjson, post_headers
 
 
 @pytest.fixture()
@@ -31,6 +33,12 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(config, "SYNC_DISABLED", False)
     monkeypatch.setattr(sync_receiver, "_receiver", None)
+    # Pin the LAN probe so diagnosis does not depend on the test machine's
+    # interfaces (a CI runner or a VPN could otherwise add a note).
+    monkeypatch.setattr(sync_receiver, "_default_route_address",
+                        lambda: "192.168.1.14")
+    monkeypatch.setattr(sync_receiver, "_interface_addresses",
+                        lambda: ["127.0.0.1", "192.168.1.14"])
     server._schema_ready = False            # re-init schema against this DB
     return tmp_path
 
@@ -84,6 +92,8 @@ def test_rotate_invalidates_the_phone_that_was_paired(sandbox, listener):
         json.loads(rotated["pairing_json"])["token"]) is True
     assert rotated["payload"]["device_id"] == \
         json.loads(server.pair_device()["pairing_json"])["device_id"]
+    # The QR's "device_id" key carries the service id; the tool says so.
+    assert rotated["service_id"] == rotated["payload"]["device_id"]
 
 
 def test_pair_device_renders_a_qr(sandbox, listener):
@@ -221,3 +231,39 @@ def test_sync_status_surfaces_a_failed_batch(sandbox, listener):
     status = server.sync_status()
     assert status["spool"]["failed"] == 1
     assert any("failed to import" in note for note in status["diagnosis"])
+
+
+def test_sync_status_says_when_there_is_no_usable_lan_address(sandbox, listener,
+                                                             monkeypatch):
+    server.pair_device()
+    monkeypatch.setattr(sync_receiver, "_default_route_address",
+                        lambda: "240.0.0.2")
+    monkeypatch.setattr(sync_receiver, "_interface_addresses",
+                        lambda: ["127.0.0.1", "240.0.0.2"])
+
+    status = server.sync_status()
+    assert status["listener"]["lan_address"] is None
+    assert any("No private LAN address" in note for note in status["diagnosis"])
+
+
+def test_sync_status_separates_the_service_id_from_the_phone_id(sandbox,
+                                                               listener):
+    server.pair_device()
+    before = server.sync_status()["pairing"]
+    assert before["service_id"]
+    assert before["last_seen_device_id"] is None
+    assert "device_id" not in before
+    assert any("No batch has arrived" in note
+               for note in server.sync_status()["diagnosis"])
+
+    pairing = sync_pairing.load()
+    status_code, _ = call(listener, "/batch",
+                          data=gzip.compress(ndjson(BATCH_LINES)),
+                          headers=post_headers(pairing, "ident-batch", 2,
+                                               **{"X-Device-Id": "phone-X"}))
+    assert status_code == 200
+
+    after = server.sync_status()
+    assert after["pairing"]["last_seen_device_id"] == "phone-X"
+    assert after["pairing"]["service_id"] == before["service_id"]
+    assert not any("No batch has arrived" in note for note in after["diagnosis"])

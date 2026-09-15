@@ -28,13 +28,14 @@ disk answers 200 with ``duplicate:true`` and rewrites nothing.
 from __future__ import annotations
 
 import gzip
+import ipaddress
 import json
 import logging
 import socket
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from . import config, sync_pairing, sync_protocol, sync_spool
 
@@ -70,26 +71,94 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def lan_address() -> str:
-    """Best guess at the LAN address the phone should connect to.
+# The only ranges a phone on the same Wi-Fi can actually reach (RFC 1918).
+# An allowlist rather than a blocklist: loopback (127/8), link-local
+# (169.254/16), multicast (224/4), IANA-reserved Class E (240/4) and 0.0.0.0
+# all fall outside it, and so does whatever a VPN or proxy TUN interface
+# invents next. A VPN taking the default route is the realistic failure — a
+# utun at 240.0.0.2 once got advertised to the phone as the Mac's address.
+PRIVATE_LAN_NETWORKS = tuple(ipaddress.IPv4Network(net) for net in
+                             ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+
+def is_private_lan(address: Optional[str]) -> bool:
+    """True only for an IPv4 address in 10/8, 172.16/12 or 192.168/16."""
+    try:
+        ip = ipaddress.IPv4Address(address)
+    except (ipaddress.AddressValueError, ValueError, TypeError):
+        return False
+    return any(ip in net for net in PRIVATE_LAN_NETWORKS)
+
+
+def choose_lan_address(candidates: Iterable[Optional[str]],
+                       default_route: Optional[str] = None) -> Optional[str]:
+    """The address to hand the phone, or None when no candidate is usable.
+
+    The default-route interface wins when it is itself a private address;
+    otherwise the first usable candidate, in the order given. None is the
+    honest answer when nothing qualifies — a wrong address sends the phone
+    somewhere it can never connect, with no clue why.
+    """
+    if is_private_lan(default_route):
+        return default_route
+    return next((a for a in candidates if is_private_lan(a)), None)
+
+
+def _default_route_address() -> Optional[str]:
+    """Local address of the interface holding the default route.
 
     Connecting a UDP socket sends nothing; it just asks the routing table which
-    local address would be used to reach the outside, which is exactly the
-    interface the phone is on. TEST-NET-1 is used as the target so no real host
-    is ever involved.
+    local address would be used to reach the outside. TEST-NET-1 is used as the
+    target so no real host is ever involved.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.connect(("192.0.2.1", 9))
         return sock.getsockname()[0]
     except OSError:
-        pass
+        return None
     finally:
         sock.close()
+
+
+def _interface_addresses() -> list[str]:
+    """Every IPv4 address on every interface.
+
+    Needed because the default route can belong to a VPN tunnel while the Wi-Fi
+    the phone shares is on another interface. ``ifaddr`` ships with zeroconf;
+    without it, fall back to whatever the hostname resolves to.
+    """
     try:
-        return socket.gethostbyname(socket.gethostname())
+        import ifaddr
+        return [ip.ip for adapter in ifaddr.get_adapters()
+                for ip in adapter.ips if isinstance(ip.ip, str)]
+    except Exception:
+        pass
+    try:
+        return socket.gethostbyname_ex(socket.gethostname())[2]
     except OSError:
-        return "127.0.0.1"
+        return []
+
+
+def lan_probe() -> tuple[Optional[str], list[str]]:
+    """(chosen address or None, every IPv4 address seen — default route first)."""
+    default = _default_route_address()
+    seen = list(dict.fromkeys(([default] if default else [])
+                              + _interface_addresses()))
+    return choose_lan_address(seen, default_route=default), seen
+
+
+def lan_address() -> Optional[str]:
+    """The private LAN address the phone should connect to, or None."""
+    return lan_probe()[0]
+
+
+def no_lan_address_note(seen: Iterable[str]) -> str:
+    return ("No private LAN address (10/8, 172.16/12, 192.168/16) on any "
+            f"interface — saw {', '.join(seen) or 'none'}. The phone has "
+            "nothing it can connect to: join the same Wi-Fi as the phone, or "
+            "if a VPN/proxy owns the default route, check the Wi-Fi interface "
+            "still has its address.")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -151,8 +220,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._unauthorized()
             return
         self.receiver.note("health")
+        # "device_id" is the wire-contract key the app parses; its value is
+        # this Mac's service id (the Bonjour TXT "did"), not the phone's id.
         self._respond(200, {"ok": True, "v": config.SYNC_PROTOCOL_VERSION,
-                            "device_id": sync_pairing.device_id(),
+                            "device_id": sync_pairing.service_id(),
                             "paired": True})
 
     def do_POST(self) -> None:                                   # noqa: N802
@@ -203,6 +274,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._bad("missing X-Batch-Id header")
             return
         device_id = (self.headers.get("X-Device-Id") or "").strip() or None
+        if device_id:
+            try:
+                sync_pairing.note_device(device_id)
+            except OSError as exc:            # bookkeeping; never cost a batch
+                _log.warning("could not record device id %s: %s", device_id, exc)
 
         # Idempotency before the body is even decompressed: a retry after an
         # ambiguous failure must be cheap and must not rewrite the spool file.
@@ -406,7 +482,13 @@ class SyncReceiver:
             return
         try:
             pairing = sync_pairing.ensure()
-            address = lan_address()
+            address, seen = lan_probe()
+            if address is None:
+                # Advertising a loopback or reserved address would lead the
+                # phone to a host it can never reach; better to say so.
+                self.bonjour_error = no_lan_address_note(seen)
+                _log.warning(self.bonjour_error)
+                return
             short = socket.gethostname().split(".")[0] or "mac"
             name = f"Apple Health Sync on {short}.{config.SYNC_SERVICE_TYPE}{config.SYNC_SERVICE_DOMAIN}"
             info = ServiceInfo(
@@ -415,7 +497,7 @@ class SyncReceiver:
                 addresses=[socket.inet_aton(address)],
                 port=int(self.port or 0),
                 properties={"v": str(config.SYNC_PROTOCOL_VERSION),
-                            "did": pairing["device_id"],
+                            "did": pairing["service_id"],
                             "path": config.SYNC_API_PREFIX},
                 server=sync_pairing.hostname(),
             )
@@ -460,22 +542,35 @@ class SyncReceiver:
     def running(self) -> bool:
         return self.httpd is not None and bool(self.thread and self.thread.is_alive())
 
-    def base_url(self) -> Optional[str]:
+    def base_url(self, lan: Optional[str] = None) -> Optional[str]:
+        """URL the phone should use; None when there is no reachable address.
+
+        ``lan`` lets a caller that already probed the interfaces pass the
+        result in, so the URL and the reported address cannot disagree.
+        """
         if not self.running or self.port is None:
             return None
-        host = lan_address() if self.bind_host in ("", "0.0.0.0") else self.bind_host
+        if self.bind_host in ("", "0.0.0.0"):
+            host = lan if lan is not None else lan_address()
+            if host is None:
+                return None
+        else:
+            host = self.bind_host
         return f"http://{host}:{self.port}{config.SYNC_API_PREFIX}"
 
     def status(self) -> dict:
         with self._lock:
             counters = dict(self.counters)
             last = {k: v for k, v in self.last.items()}
+        lan, seen = lan_probe() if self.running else (None, [])
         return {
             "running": self.running,
             "bind_host": self.bind_host,
             "port": self.port,
-            "url": self.base_url(),
-            "lan_address": lan_address() if self.running else None,
+            "url": self.base_url(lan),
+            "lan_address": lan,
+            "lan_error": (no_lan_address_note(seen)
+                          if self.running and lan is None else None),
             "started_at": self.started_at,
             "error": self.listen_error,
             "bonjour": {
@@ -484,7 +579,7 @@ class SyncReceiver:
                 "domain": config.SYNC_SERVICE_DOMAIN,
                 "name": self.bonjour_name,
                 "txt": {"v": str(config.SYNC_PROTOCOL_VERSION),
-                        "did": sync_pairing.device_id(),
+                        "did": sync_pairing.service_id(),
                         "path": config.SYNC_API_PREFIX},
                 "error": self.bonjour_error,
             },

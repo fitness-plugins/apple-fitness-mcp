@@ -1937,7 +1937,7 @@ def pair_device(rotate: bool = False, invert: bool = False) -> dict:
     result = {
         "status": "rotated" if (rotate and existed) else
                   ("existing" if existed and not rotate else "paired"),
-        "device_id": pairing["device_id"],
+        "service_id": pairing["service_id"],
         "token_fingerprint": sync_pairing.fingerprint(pairing["token"]),
         "pairing_json": payload_json,
         "payload": payload,
@@ -2071,6 +2071,8 @@ def sync_status() -> dict:
     if not listener.get("running"):
         notes.append(f"The listener is NOT running ({listener.get('error')}). "
                      "Nothing the phone sends can arrive until it is.")
+    elif listener.get("lan_error"):
+        notes.append(listener["lan_error"])
     elif not (listener.get("bonjour") or {}).get("advertising"):
         notes.append("Bonjour is not advertising "
                      f"({(listener.get('bonjour') or {}).get('error')}). "
@@ -2081,6 +2083,16 @@ def sync_status() -> dict:
                      "phone is on the same Wi-Fi, that iOS Local Network "
                      "permission was granted to the app, and that the app was "
                      "brought to the foreground.")
+    # "Ever", not "since this process started": the persisted phone id and the
+    # spool both outlive a restart of Claude Desktop, the counters do not.
+    batch_ever = bool((pairing or {}).get("last_seen_device_id")
+                      or spool_stats.get("last_batch")
+                      or counters.get("accepted") or counters.get("duplicates"))
+    if pairing and not batch_ever:
+        notes.append("No batch has arrived from the phone yet, so its device id "
+                     "is unknown (pairing.last_seen_device_id is empty; "
+                     "pairing.service_id is this Mac's, not the phone's). "
+                     "Open the Readiness app in the foreground to push.")
     if counters.get("unauthorized") and not counters.get("accepted"):
         notes.append("Requests arrived but every one was rejected as "
                      "unauthenticated — the phone is holding an old token. "
@@ -2104,7 +2116,8 @@ def sync_status() -> dict:
         "listener": listener,
         "pairing": {
             "paired": bool(pairing),
-            "device_id": (pairing or {}).get("device_id"),
+            "service_id": (pairing or {}).get("service_id"),
+            "last_seen_device_id": (pairing or {}).get("last_seen_device_id"),
             "token_fingerprint": sync_pairing.fingerprint((pairing or {}).get("token")),
             "created_at": (pairing or {}).get("created_at"),
             "rotated_at": (pairing or {}).get("rotated_at"),

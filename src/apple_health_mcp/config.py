@@ -128,7 +128,7 @@ def ensure_dirs() -> None:
 #
 # Wire contract v1 (an iOS client is built against these exact strings):
 #   Bonjour service  _healthsync._tcp  in  local.
-#   TXT records      v=1, did=<device_id>, path=/v1
+#   TXT records      v=1, did=<service_id of this Mac>, path=/v1
 #   Auth header      X-Health-Token: <base64url of 32 random bytes, unpadded>
 SYNC_PROTOCOL_VERSION = 1
 SYNC_SERVICE_TYPE = "_healthsync._tcp."      # zeroconf wants the trailing dot
@@ -151,7 +151,8 @@ def sync_spool_dir() -> Path:
     return SYNC_SPOOL_DIR or (EXPORT_DIR / SYNC_SPOOL_DIR_NAME)
 
 
-# Pairing state (shared token + this Mac's stable device id). Written 0600 into
+# Pairing state (shared token, this Mac's stable service id, the phone's last
+# seen device id). Written 0600 into
 # data/, which is git-ignored. Resolved at call time for the same reason.
 SYNC_PAIRING_NAME = "sync_pairing.json"
 SYNC_PAIRING_PATH = (Path(os.environ["HEALTH_SYNC_PAIRING"])
@@ -159,7 +160,7 @@ SYNC_PAIRING_PATH = (Path(os.environ["HEALTH_SYNC_PAIRING"])
 
 
 def sync_pairing_path() -> Path:
-    """Absolute path of the pairing file (token + device id), resolved now."""
+    """Absolute path of the pairing file (token + ids), resolved now."""
     return SYNC_PAIRING_PATH or (STATE_DIR / SYNC_PAIRING_NAME)
 
 

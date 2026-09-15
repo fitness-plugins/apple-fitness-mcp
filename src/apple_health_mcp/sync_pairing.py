@@ -1,4 +1,4 @@
-"""Pairing state for LAN delta sync: the shared token and this Mac's device id.
+"""Pairing state for LAN delta sync: the shared token and the two identities.
 
 One pre-shared token, generated here and carried to the phone by QR. Without it
 anyone on the same Wi-Fi could write into a health database the user makes
@@ -8,6 +8,14 @@ constant-time.
 The file lives in ``data/`` (git-ignored) with mode 0600. It is written
 atomically — a half-written pairing file would lock the phone out with no way
 to tell why.
+
+Two ids live here and must not be confused:
+
+* ``service_id`` — generated on this Mac; identifies the *sync service* and is
+  what the Bonjour TXT ``did`` advertises. (It was once stored as
+  ``device_id``, which read as the phone's id; old files are migrated on load.)
+* ``last_seen_device_id`` — the *phone's* id, taken from the ``X-Device-Id``
+  header of the last batch it pushed. Empty until a batch arrives.
 """
 from __future__ import annotations
 
@@ -18,6 +26,7 @@ import json
 import os
 import secrets
 import socket
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +36,11 @@ from . import config
 
 TOKEN_BYTES = 32          # 256 bits; base64url-unpadded -> 43 characters
 FILE_MODE = 0o600
+
+# Read-modify-write of the pairing file happens from the MCP tool thread
+# (pair_device) and from receiver threads (note_device). Without this lock a
+# batch landing mid-rotation could write the old token back.
+_lock = threading.Lock()
 
 
 def _now() -> str:
@@ -73,6 +87,8 @@ def load() -> Optional[dict]:
         return None
     if not isinstance(data, dict) or not data.get("token"):
         return None
+    if "service_id" not in data and data.get("device_id"):
+        data["service_id"] = data.pop("device_id")        # pre-rename file
     return data
 
 
@@ -101,21 +117,39 @@ def _write(data: dict) -> Path:
 def ensure(rotate: bool = False) -> dict:
     """Return the pairing state, creating or rotating the token as asked.
 
-    The device id is stable across rotations: it identifies the *Mac*, not the
-    credential, and the Bonjour TXT record advertises it.
+    The service id is stable across rotations: it identifies the *Mac's sync
+    service*, not the credential, and the Bonjour TXT record advertises it. The
+    phone's last seen id survives a rotation too — it is still the same phone.
     """
-    current = load()
-    if current and not rotate:
-        return current
-    data = {
-        "v": config.SYNC_PROTOCOL_VERSION,
-        "token": generate_token(),
-        "device_id": (current or {}).get("device_id") or str(uuid.uuid4()),
-        "created_at": (current or {}).get("created_at") or _now(),
-        "rotated_at": _now() if current else None,
-    }
-    _write(data)
-    return data
+    with _lock:
+        current = load()
+        if current and not rotate:
+            return current
+        prior = current or {}
+        data = {
+            "v": config.SYNC_PROTOCOL_VERSION,
+            "token": generate_token(),
+            "service_id": prior.get("service_id") or str(uuid.uuid4()),
+            "last_seen_device_id": prior.get("last_seen_device_id"),
+            "created_at": prior.get("created_at") or _now(),
+            "rotated_at": _now() if current else None,
+        }
+        _write(data)
+        return data
+
+
+def note_device(device_id: str) -> None:
+    """Remember the phone's id from an incoming batch's ``X-Device-Id``.
+
+    Written only when it changes, so the file holding the token is not
+    rewritten on every batch. Never touches the token or the service id.
+    """
+    with _lock:
+        current = load()
+        if not current or current.get("last_seen_device_id") == device_id:
+            return
+        current["last_seen_device_id"] = device_id
+        _write(current)
 
 
 def verify(token: Optional[str]) -> bool:
@@ -137,9 +171,9 @@ def is_paired() -> bool:
     return load() is not None
 
 
-def device_id() -> Optional[str]:
+def service_id() -> Optional[str]:
     data = load()
-    return data.get("device_id") if data else None
+    return data.get("service_id") if data else None
 
 
 def pairing_payload(port: int, host: Optional[str] = None,
@@ -152,7 +186,9 @@ def pairing_payload(port: int, host: Optional[str] = None,
         "service": config.SYNC_SERVICE_TYPE.rstrip("."),
         "host": host or hostname(),
         "port": int(port),
-        "device_id": data["device_id"],
+        # Wire-contract key the app already parses; the value is the service
+        # id (the Mac's), not a phone id.
+        "device_id": data["service_id"],
     }
 
 
